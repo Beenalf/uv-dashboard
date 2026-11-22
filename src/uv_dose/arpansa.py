@@ -80,6 +80,7 @@ class DayData:
     day: date
     samples: list[Sample]
     fetched_at: datetime = field(default_factory=datetime.now)
+    outlook_from: date | None = None  # set on a future day built from this day's clear-sky forecast
 
     @property
     def has_measurements(self) -> bool:
@@ -235,6 +236,44 @@ def parse_day(payload: Any, site: Site, day: date) -> DayData:
     return DayData(site=site, day=day, samples=_fill_sparse_forecast(samples))
 
 
+# --------------------------------------------------------------------------- outlook for tomorrow
+
+# ARPANSA publishes nothing for future dates (checked Nov 2026). A clear-sky
+# forecast changes very little from one day to the next (the sun's path shifts
+# by well under a degree), so tomorrow's clear-sky curve is taken from today's.
+MAX_DAYS_AHEAD = 1
+
+# States that use daylight saving: from 2 am on the first Sunday in October to
+# 3 am on the first Sunday in April. The API's times are local clock times, so an
+# outlook across a changeover must shift by an hour.
+DST_STATES = frozenset({"NSW", "VIC", "ACT", "TAS", "SA"})
+
+
+def _first_sunday(year: int, month: int) -> date:
+    d = date(year, month, 1)
+    return d + timedelta(days=(6 - d.weekday()) % 7)
+
+
+def observes_dst(site: Site, day: date) -> bool:
+    """Whether the site's clocks are on daylight saving time during the day (from 6 am)."""
+    if site.state.upper() not in DST_STATES:
+        return False
+    return day >= _first_sunday(day.year, 10) or day < _first_sunday(day.year, 4)
+
+
+def clear_sky_outlook(base: DayData, target: date) -> DayData:
+    """A clear-sky stand-in for ``target`` (a future day), from ``base``'s forecast.
+
+    Measurements are dropped. Times move to ``target``, plus or minus an hour if
+    daylight saving starts or ends in between, so the curve stays on the sun's
+    schedule.
+    """
+    shift = target - base.day
+    shift += timedelta(hours=int(observes_dst(base.site, target)) - int(observes_dst(base.site, base.day)))
+    samples = [Sample(s.time + shift, None, s.forecast) for s in base.samples]
+    return DayData(site=base.site, day=target, samples=samples, fetched_at=base.fetched_at, outlook_from=base.day)
+
+
 class ArpansaClient:
     """Small, thread-safe JSON client with an in-memory cache."""
 
@@ -264,6 +303,10 @@ class ArpansaClient:
 
     def sites(self) -> list[Site]:
         return parse_sites(self._get_json("api/categoriesSites"))
+
+    def outlook(self, site: Site, day: date, *, force: bool = False) -> DayData:
+        """Clear-sky outlook for a future ``day``, from today's forecast."""
+        return clear_sky_outlook(self.day(site, date.today(), force=force), day)
 
     def day(self, site: Site, day: date, *, force: bool = False) -> DayData:
         key = (site.code, day)

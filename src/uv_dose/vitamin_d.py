@@ -24,6 +24,8 @@ from dataclasses import dataclass
 IU_PER_MED_WHOLE_BODY = 16_000.0
 PLATEAU_MED = 1.0
 DEFAULT_TARGET_IU = 1000
+# Steps for the goal's arrows. Any other value can be typed in.
+GOAL_STEPS_IU: tuple[int, ...] = (1000, 1500, 2000, 3000, 4000, 5000, 7500, 10000)
 
 
 @dataclass(frozen=True)
@@ -72,3 +74,15 @@ def dose_for_vitamin_d(target_iu: float, med_sed: float, body_fraction: float) -
     if meds >= PLATEAU_MED:
         return None
     return meds * med_sed
+
+
+def most_before_burning(body_fraction: float) -> float:
+    """The most vitamin D (IU) a day's exposure can make before reaching the burn threshold."""
+    return IU_PER_MED_WHOLE_BODY * max(body_fraction, 0.0) * PLATEAU_MED
+
+
+def next_goal(current: float, direction: int) -> float:
+    """The next goal step above (direction > 0) or below ``current``, or ``current`` at either end."""
+    if direction > 0:
+        return next((g for g in GOAL_STEPS_IU if g > current), current)
+    return next((g for g in reversed(GOAL_STEPS_IU) if g < current), current)

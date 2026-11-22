@@ -101,9 +101,10 @@ class TimeSpinbox(ttk.Spinbox):
 
 
 class DateControl(ttk.Frame):
-    def __init__(self, master: tk.Misc, on_change: Callable[[date], None]) -> None:
+    def __init__(self, master: tk.Misc, on_change: Callable[[date], None], max_days_ahead: int = 0) -> None:
         super().__init__(master)
         self._on_change = on_change
+        self._ahead = timedelta(days=max_days_ahead)
         self._date = date.today()
         self.var = tk.StringVar(value=fmt_date(self._date))
         ttk.Button(self, text="◀", width=3, command=lambda: self.shift(-1)).grid(row=0, column=0)
@@ -123,7 +124,7 @@ class DateControl(ttk.Frame):
         return self._date
 
     def set(self, d: date, notify: bool = True) -> None:
-        d = min(d, date.today())
+        d = min(d, date.today() + self._ahead)
         changed = d != self._date
         self._date = d
         self._refresh()
@@ -146,7 +147,7 @@ class DateControl(ttk.Frame):
     def _refresh(self) -> None:
         self.var.set(fmt_date(self._date))
         self.weekday.configure(text=self._date.strftime("%A"))
-        self.next_btn.state(["disabled"] if self._date >= date.today() else ["!disabled"])
+        self.next_btn.state(["disabled"] if self._date >= date.today() + self._ahead else ["!disabled"])
 
 
 # ------------------------------------------------------------------ result card
@@ -253,24 +254,60 @@ class ResultCard(tk.Frame):
 
 
 class ScrollableFrame(ttk.Frame):
-    """A vertically scrolling container; put children in ``.inner``."""
+    """A vertically scrolling container; put children in ``.inner``.
 
-    def __init__(self, master: tk.Misc, background: str, **kw) -> None:
+    ``fit_width`` makes the frame as wide as its contents (for a sidebar), and
+    ``autohide`` shows the scrollbar only when the contents are taller than the frame.
+    """
+
+    def __init__(self, master: tk.Misc, background: str, *, fit_width: bool = False, autohide: bool = False,
+                 **kw) -> None:
         super().__init__(master, **kw)
+        self._fit_width = fit_width
+        self._autohide = autohide
         self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, background=background)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vbar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.vbar.grid(row=0, column=1, sticky="ns", padx=(4, 0) if fit_width else 0)
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         self.inner = ttk.Frame(self.canvas)
         self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width))
+        self.inner.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
         # Only capture the mouse wheel while the pointer is over this frame.
         self.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
         self.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
 
+    def set_background(self, color: str) -> None:
+        self.canvas.configure(background=color)
+
+    def _on_inner(self, event: tk.Event) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        if self._fit_width:
+            self.canvas.configure(width=self.inner.winfo_reqwidth())
+        self._update_bar()
+
+    def _on_canvas(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self._win, width=event.width)
+        self._update_bar()
+
+    def _fits(self) -> bool:
+        return self.inner.winfo_reqheight() <= self.canvas.winfo_height()
+
+    def _update_bar(self) -> None:
+        if not self._autohide:
+            return
+        if self._fits():
+            self.vbar.grid_remove()
+            self.canvas.yview_moveto(0)
+        else:
+            self.vbar.grid()
+
     def _on_wheel(self, event: tk.Event) -> None:
+        if self._autohide and self._fits():
+            return
+        if isinstance(event.widget, (ttk.Spinbox, ttk.Combobox)):
+            return  # those use the wheel to change their value
         self.canvas.yview_scroll(int(-event.delta / 120), "units")

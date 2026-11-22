@@ -31,6 +31,7 @@ DASH_THRESHOLD = (0, (6, 3))
 DASH_TAIL = (0, (1.5, 2.5))
 CLICK_TOLERANCE = timedelta(minutes=2)
 CLICK_PIXELS = 4
+PROTECTION_COLOR = UV_CATEGORIES[2].color  # the "High" orange: a caution colour that reads on light and dark
 
 
 @dataclass
@@ -43,10 +44,11 @@ class ChartView:
     forecast: list[float | None] = field(default_factory=list)
     show_measured: bool = True
     latest_reading: datetime | None = None  # only on a live (today) chart
-    window_start: datetime | None = None
-    window_end: datetime | None = None
-    curve: tuple[list[datetime], list[float]] = ((), ())  # dose on skin across the window
-    tail: tuple[list[datetime], list[float]] = ((), ())  # ... continued past the window end
+    outings: list[tuple[datetime, datetime]] = field(default_factory=list)
+    selected: int | None = None  # index into ``outings`` of the one being edited
+    protection: tuple[datetime, datetime] | None = None  # when UV is 3 or above
+    curve: tuple[list[datetime], list[float]] = ((), ())  # dose on skin across the outings
+    tail: tuple[list[datetime], list[float]] = ((), ())  # ... continued after the last outing
     clear_curve: tuple[list[datetime], list[float]] = ((), ())  # clear-sky equivalent, for comparison
     dose_label: str = "Dose on your skin"
     med_sed: float = 2.5
@@ -55,6 +57,7 @@ class ChartView:
     vitd_at: datetime | None = None
     message: str | None = None  # shown instead of data (no data / loading / error)
     describe: Callable[[datetime], str] | None = None  # hover readout text
+    hint: str = "Drag to pick a time window · click to set the start"
 
 
 class DoseChart:
@@ -141,12 +144,15 @@ class DoseChart:
             ax1.text(1.008, (lo + min(hi, ymax)) / 2, cat.name, transform=band_tf, fontsize=8,
                      color=p.ink2, va="center", ha="left", clip_on=False)
 
-        if v.window_start and v.window_end:
+        many = len(v.outings) > 1
+        for i, (start, end) in enumerate(v.outings):
+            chosen = i == v.selected or not many
             for ax in (ax1, ax2):
-                ax.axvspan(v.window_start, v.window_end, color=p.series, alpha=p.select_alpha, lw=0, zorder=0.5)
-                for edge in (v.window_start, v.window_end):
-                    ax.axvline(edge, color=p.series, lw=0.8, alpha=0.6, zorder=0.6)
-
+                ax.axvspan(start, end, color=p.series, alpha=p.select_alpha * (1 if chosen else 0.6), lw=0,
+                           zorder=0.5)
+                for edge in (start, end):
+                    ax.axvline(edge, color=p.series, lw=0.8 if chosen else 0.6, alpha=0.6 if chosen else 0.3,
+                               zorder=0.6)
         nan = float("nan")
         ax1.plot(v.times, [nan if x is None else x for x in v.forecast], color=p.forecast, lw=1.2,
                  ls=DASH_FORECAST, label="Clear-sky forecast", zorder=2)
@@ -157,8 +163,10 @@ class DoseChart:
             ax1.axvline(v.latest_reading, color=p.muted, lw=0.9, zorder=1)
             ax1.annotate(f"Latest reading {v.latest_reading:%H:%M}", (v.latest_reading, ymax), xytext=(4, -4),
                          textcoords="offset points", va="top", ha="left", fontsize=8, color=p.ink2)
+        if v.protection:
+            self._draw_protection(*v.protection)
         ax1.set_ylabel("UV Index", color=p.ink2)
-        ax1.legend(loc="upper left", frameon=False, fontsize=8, ncols=2, labelcolor=p.ink2,
+        ax1.legend(loc="upper left", frameon=False, fontsize=8, ncols=3, labelcolor=p.ink2,
                    bbox_to_anchor=(0, 1.0))
 
         # ---------------- bottom panel: dose on skin
@@ -171,7 +179,8 @@ class DoseChart:
                      zorder=2)
         kt, kv = v.clear_curve
         if kt:
-            ax2.plot(kt, kv, color=p.forecast, lw=1.1, ls=DASH_FORECAST, label="Same window, clear sky", zorder=2)
+            ax2.plot(kt, kv, color=p.forecast, lw=1.1, ls=DASH_FORECAST,
+                     label="Same outings, clear sky" if len(v.outings) > 1 else "Same window, clear sky", zorder=2)
 
         top = max(v.med_sed * 1.3, (cv[-1] if cv else 0) * 1.15, (kv[-1] if kv else 0) * 1.05,
                   (v.vitd_sed or 0) * 1.3, 0.5)
@@ -210,7 +219,7 @@ class DoseChart:
                        bbox_to_anchor=(0, 1.02))
 
         # ---------------- interaction
-        self._hint = "Drag to pick a time window · click to set the start"
+        self._hint = v.hint
         self._readout = ax1.text(1.0, 1.02, self._hint, transform=ax1.transAxes, ha="right", va="bottom",
                                  fontsize=8, color=p.ink2)
         self._hover_lines = [
@@ -236,6 +245,13 @@ class DoseChart:
         ax.tick_params(colors=p.ink2, labelcolor=p.ink2, length=3, width=0.6)
         ax.grid(axis="y", color=p.grid, lw=0.6, ls="-")
         ax.set_axisbelow(True)
+
+    def _draw_protection(self, start: datetime, end: datetime) -> None:
+        """A bar along the foot of the UV panel for when UV is 3 or above; the legend gives the times."""
+        ax = self.ax_uv
+        tf = blended_transform_factory(ax.transData, ax.transAxes)
+        ax.plot([start, end], [0.018, 0.018], transform=tf, color=PROTECTION_COLOR, lw=5, solid_capstyle="butt",
+                zorder=1.8, label=f"Sun protection {start:%H:%M}–{end:%H:%M} (UV 3+)")
 
     def _label_thresholds(self, med: float, vitd: float | None) -> None:
         """Name the threshold lines in the right margin (like the UV bands above)."""

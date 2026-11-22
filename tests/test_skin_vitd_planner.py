@@ -6,9 +6,9 @@ import pytest
 
 from conftest import constant_day
 from uv_dose.dose import build_series
-from uv_dose.planner import plan_exposure
+from uv_dose.planner import Outing, plan_day
 from uv_dose.skin import MAX_SCORE, QUESTIONS, SKIN_TYPES, score_answers, skin_type_from_score
-from uv_dose.vitamin_d import dose_for_vitamin_d, vitamin_d_iu
+from uv_dose.vitamin_d import dose_for_vitamin_d, most_before_burning, next_goal, vitamin_d_iu
 
 # ---------------------------------------------------------------- Fitzpatrick
 
@@ -65,19 +65,51 @@ def test_vitamin_d_plateau_and_unreachable():
 def test_plan_constant_sun():
     t0 = datetime(2026, 1, 1, 10, 0)
     series = build_series(constant_day(10.0, t0, 300))  # 0.15 SED/min
-    plan = plan_exposure(series, t0, med_sed=2.5, target_iu=1000, body_fraction=0.25)
-    assert plan.burn_after == timedelta(minutes=2.5 / 0.15)  # 16 min 40 s
-    assert plan.vitd_after == timedelta(minutes=0.625 / 0.15)  # ~4 min 10 s
-    assert plan.vitd_at < plan.burn_at
+    plan = plan_day(series, [Outing(t0, t0 + timedelta(hours=1))], med_sed=2.5, target_iu=1000, body_fraction=0.25)
+    assert plan.burn.sun_time == timedelta(minutes=2.5 / 0.15)  # 16 min 40 s
+    assert plan.burn.at == t0 + plan.burn.sun_time and plan.burn.outing == 0
+    assert plan.vitd.sun_time == timedelta(minutes=0.625 / 0.15)  # ~4 min 10 s
+    assert plan.vitd.at < plan.burn.at
     assert not plan.relies_on_forecast
 
-    with_spf = plan_exposure(series, t0, med_sed=2.5, spf=30, target_iu=1000, body_fraction=0.25)
-    assert with_spf.burn_at is None  # only 300 min of data -> 1.5 SED effective
+    # SPF 30 slows accumulation 30-fold: only 300 min of data -> 1.5 SED, so no burn
+    with_spf = plan_day(series, [Outing(t0, t0 + timedelta(hours=1), 1 / 30)], med_sed=2.5)
+    assert with_spf.burn is None
     assert with_spf.dose_available == pytest.approx(1.5)
+
+
+def test_plan_interpolates_within_the_minute():
+    t0 = datetime(2026, 1, 1, 10, 0)
+    series = build_series(constant_day(10.0, t0, 240))  # 0.15 SED/min
+    plan = plan_day(series, [Outing(t0, t0 + timedelta(minutes=5))], med_sed=0.075)
+    assert plan.burn.at == t0 + timedelta(seconds=30)
+    # SPF 10 (factor 0.1): 1 SED needs 66 min 40 s, past the 5-minute window, so it's in the tail
+    tail = plan_day(series, [Outing(t0, t0 + timedelta(minutes=5), 0.1)], med_sed=1.0)
+    assert tail.burn.at == t0 + timedelta(minutes=66, seconds=40)
+    assert tail.burn.outing is None
 
 
 def test_plan_on_real_partial_day_flags_forecast(mel_partial_day):
     series = build_series(mel_partial_day)
-    plan = plan_exposure(series, datetime(2026, 11, 21, 15, 0), med_sed=2.5)
-    assert plan.burn_at is not None
+    t = datetime(2026, 11, 21, 15, 0)
+    plan = plan_day(series, [Outing(t, t + timedelta(minutes=10))], med_sed=2.5)
+    assert plan.burn is not None
     assert plan.relies_on_forecast  # measurements end at 15:17
+
+
+def test_most_before_burning_limits_high_goals():
+    assert most_before_burning(0.25) == pytest.approx(4000)
+    assert most_before_burning(0.85) == pytest.approx(13600)
+    # 10,000 IU is out of reach with face, arms and hands, but not in swimwear
+    assert dose_for_vitamin_d(10_000, 2.5, 0.25) is None
+    assert dose_for_vitamin_d(10_000, 2.5, 0.85) == pytest.approx(10_000 / 13_600 * 2.5)
+
+
+def test_goal_steps_from_1000_to_10000():
+    assert next_goal(1000, +1) == 1500
+    assert next_goal(1200, +1) == 1500  # a typed value goes to the next step
+    assert next_goal(1200, -1) == 1000
+    assert next_goal(7500, +1) == 10000
+    assert next_goal(10000, +1) == 10000  # stays at the ends
+    assert next_goal(1000, -1) == 1000
+    assert next_goal(600, -1) == 600 and next_goal(600, +1) == 1000

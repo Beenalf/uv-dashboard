@@ -9,10 +9,9 @@ from uv_dose.dose import (
     SED_PER_UVI_MINUTE,
     Source,
     build_series,
-    cumulative_curve,
     hourly_breakdown,
     rate_dose,
-    time_to_dose,
+    sun_protection_times,
     uv_category,
     window_dose,
 )
@@ -32,24 +31,6 @@ def test_constant_uvi_one_hour():
     assert wd.sed == pytest.approx(9.0)  # 10 UVI * 0.015 * 60
     assert wd.joules_per_m2 == pytest.approx(900.0)
     assert wd.peak_uvi == 10.0 and wd.mean_uvi == pytest.approx(10.0)
-
-
-def test_time_to_dose_interpolates_and_respects_spf():
-    series = build_series(constant_day(10.0, T0, 240))  # 0.15 SED/min
-    assert time_to_dose(series, T0, 3.0) == T0 + timedelta(minutes=20)
-    assert time_to_dose(series, T0, 0.075) == T0 + timedelta(seconds=30)
-    # SPF 30 slows accumulation 30-fold: 3 SED effective needs 600 min -> beyond data
-    assert time_to_dose(series, T0, 3.0, spf=30) is None
-    assert time_to_dose(series, T0, 1.0, spf=10) == T0 + timedelta(minutes=66, seconds=40)
-
-
-def test_cumulative_curve_matches_window_dose(mel_day):
-    series = build_series(mel_day)
-    start, end = datetime(2026, 11, 20, 9, 30), datetime(2026, 11, 20, 14, 15)
-    times, values = cumulative_curve(series, start, end)
-    assert times[0] == start and values[0] == 0
-    assert times[-1] == end
-    assert values[-1] == pytest.approx(window_dose(series, start, end).sed)
 
 
 @pytest.mark.parametrize(("source", "column"), [(Source.BEST, "CumulativeMeasured"), (Source.CLEAR_SKY, "CumulativeForecast")])
@@ -104,3 +85,17 @@ def test_uv_category(uvi, name):
 )
 def test_rate_dose(dose, level):
     assert rate_dose(dose, med_sed=2.5).level == level
+
+
+def test_sun_protection_times(mel_day):
+    prot = sun_protection_times(build_series(mel_day, Source.CLEAR_SKY))
+    assert prot is not None
+    # Melbourne, 20 Nov 2026, clear sky: UV 3+ from mid-morning to late afternoon
+    assert datetime(2026, 11, 20, 8, 0) < prot.start < datetime(2026, 11, 20, 10, 0)
+    assert datetime(2026, 11, 20, 15, 30) < prot.end < datetime(2026, 11, 20, 18, 0)
+
+
+def test_sun_protection_times_threshold_and_none():
+    assert sun_protection_times(build_series(constant_day(2.4, T0, 60))) is None  # rounds to 2
+    prot = sun_protection_times(build_series(constant_day(2.5, T0, 60)))  # rounds to 3
+    assert (prot.start, prot.end) == (T0, T0 + timedelta(minutes=60))

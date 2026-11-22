@@ -24,13 +24,14 @@ class Settings:
     site_code: str = "mel"
     skin_type: int = 2
     med_sed: float | None = None  # None -> use the skin type's default
-    spf: int = 1  # 1 == no sunscreen
     body_key: str = "face_arms"
     target_iu: int = 1000
+    application: str = "typical"  # how thickly sunscreen goes on (uv_dose.exposure.APPLICATION_CHOICES)
     source: str = "best"
     dark: bool = False
-    start: str = "10:00"
-    end: str = "14:00"
+    # The day's plan, as times of day: [{"start": "10:00", "end": "14:00", "shade": "sun",
+    # "surface": "ground", "spf": 1}, ...]. Validated by the window that uses it.
+    outings: list[dict] = field(default_factory=list)
     quiz_answers: dict[str, int] = field(default_factory=dict)
 
     @classmethod
@@ -40,6 +41,12 @@ class Settings:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return cls()
+        if not isinstance(raw, dict):
+            return cls()
+        if "outings" not in raw and "start" in raw:  # files from before outings: one window + one SPF
+            raw["outings"] = [{"start": raw.get("start"), "end": raw.get("end"), "spf": raw.get("spf", 1)}]
+        if not isinstance(raw.get("outings", []), list):
+            raw.pop("outings")
         known = {f.name for f in fields(cls)}
         try:
             return cls(**{k: v for k, v in raw.items() if k in known})

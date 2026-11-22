@@ -111,44 +111,6 @@ def window_dose(series: Sequence[UVPoint], start: datetime, end: datetime) -> Wi
     )
 
 
-def cumulative_curve(
-    series: Sequence[UVPoint], start: datetime, end: datetime, spf: float = 1.0
-) -> tuple[list[datetime], list[float]]:
-    """Running dose from ``start``; one point at the end of each minute."""
-    times = [start]
-    values = [0.0]
-    total = 0.0
-    for p in in_window(series, start, end):
-        total += minute_dose(p.uvi, spf)
-        times.append(p.time + ONE_MINUTE)
-        values.append(total)
-    return times, values
-
-
-def time_to_dose(
-    series: Sequence[UVPoint], start: datetime, target_sed: float, spf: float = 1.0
-) -> datetime | None:
-    """When the running dose from ``start`` first reaches ``target_sed``.
-
-    Interpolates within the minute. Returns None if the day's data ends first.
-    """
-    if target_sed <= 0:
-        return start
-    total = 0.0
-    for p in series:
-        if p.time < start:
-            continue
-        d = minute_dose(p.uvi, spf)
-        if d > 0 and total + d >= target_sed:
-            return p.time + timedelta(minutes=(target_sed - total) / d)
-        total += d
-    return None
-
-
-def dose_until_end(series: Sequence[UVPoint], start: datetime, spf: float = 1.0) -> float:
-    return sum(minute_dose(p.uvi, spf) for p in series if p.time >= start)
-
-
 # --------------------------------------------------------------------------- hourly table
 
 
@@ -221,6 +183,25 @@ def uv_category(uvi: float) -> UVCategory:
         if rounded >= math.ceil(cat.lower):
             return cat
     return UV_CATEGORIES[0]
+
+
+# Cancer Council and ARPANSA advise sun protection whenever the UV Index is 3 or
+# above. Readings are rounded to whole numbers, so 2.5 counts as 3.
+SUN_PROTECTION_UVI = 2.5
+
+
+@dataclass(frozen=True)
+class ProtectionTimes:
+    start: datetime  # first minute at UV 3+
+    end: datetime  # end of the last minute at UV 3+
+
+
+def sun_protection_times(series: Sequence[UVPoint]) -> ProtectionTimes | None:
+    """The span of the day when UV is 3 or above (SunSmart's "sun protection times")."""
+    hits = [p.time for p in series if p.uvi >= SUN_PROTECTION_UVI]
+    if not hits:
+        return None
+    return ProtectionTimes(hits[0], hits[-1] + ONE_MINUTE)
 
 
 Level = Literal["low", "moderate", "high", "very_high"]

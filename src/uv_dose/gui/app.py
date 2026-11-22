@@ -19,33 +19,61 @@ from uv_dose.arpansa import (
     DOSE_PAGE_URL,
     EARLIEST_DATE,
     FALLBACK_SITES,
+    MAX_DAYS_AHEAD,
     ArpansaClient,
     DayData,
     Site,
     sort_sites,
 )
 from uv_dose.dose import (
-    ONE_MINUTE,
+    ProtectionTimes,
     Source,
     UVPoint,
     build_series,
-    cumulative_curve,
-    hourly_breakdown,
-    minute_dose,
     rate_dose,
+    sun_protection_times,
     uv_category,
     window_dose,
 )
+from uv_dose.exposure import (
+    APPLICATION_CHOICES,
+    DEFAULT_APPLICATION,
+    REAPPLY_HOURS,
+    SHADE_CHOICES,
+    SURFACE_CHOICES,
+    Choice,
+    choice,
+    effective_spf,
+    exposure_factor,
+)
 from uv_dose.gui.chart import ChartView, DoseChart
+from uv_dose.gui.outings import MAX_OUTINGS, OutingList, OutingSpec
 from uv_dose.gui.quiz import FitzpatrickDialog
 from uv_dose.gui.theme import LEVEL_ICON, Palette, apply_ttk_theme, fonts, status_color
-from uv_dose.gui.widgets import DateControl, ResultCard, TimeSpinbox, fmt_clock, fmt_duration, parse_time
-from uv_dose.planner import SunPlan, plan_exposure
+from uv_dose.gui.widgets import (
+    DateControl,
+    ResultCard,
+    ScrollableFrame,
+    TimeSpinbox,
+    fmt_clock,
+    fmt_duration,
+    parse_time,
+)
+from uv_dose.planner import DayPlan, Outing, plan_curves, plan_day, plan_hours, value_at
 from uv_dose.settings import Settings
 from uv_dose.skin import SKIN_TYPES, SkinType, skin_type
-from uv_dose.vitamin_d import PLATEAU_MED, BODY_EXPOSURES, BodyExposure, body_exposure, vitamin_d_iu
+from uv_dose.vitamin_d import (
+    BODY_EXPOSURES,
+    PLATEAU_MED,
+    BodyExposure,
+    body_exposure,
+    most_before_burning,
+    next_goal,
+    vitamin_d_iu,
+)
 
-SPF_CHOICES: tuple[tuple[str, int], ...] = (("None", 1), ("SPF 15", 15), ("SPF 30", 30), ("SPF 50+", 50))
+SPF_CHOICES: tuple[tuple[str, int], ...] = (("No sunscreen", 1), ("SPF 15", 15), ("SPF 30", 30), ("SPF 50+", 50))
+SPF_OFF_LABEL = "Off (Applied is None)"  # shown instead of the outing's SPF while sunscreen is turned off
 AUTO_REFRESH_MS = 120_000
 CARDS_ONE_ROW_MIN_WIDTH = 880  # px; below this the result cards wrap into a 2 x 2 grid
 APP_TITLE = "UV Dose"
@@ -66,15 +94,27 @@ class App:
         self._jobs: queue.Queue[tuple[Callable[[Any], None], Any]] = queue.Queue()
         self._after: dict[str, str] = {}
         self._hour_rows: list = []
-        self._last_plan: SunPlan | None = None
+
+        # The day's outings (times of day). One is selected: the sidebar fields and the
+        # chart's drag and click edit that one.
+        self.outings: list[OutingSpec] = [o for o in map(OutingSpec.from_dict, settings.outings) if o][:MAX_OUTINGS]
+        if not self.outings:
+            self.outings = [OutingSpec(time(10), time(14))]
+        self.outings.sort(key=lambda o: (o.start, o.end))
+        self.sel: OutingSpec = self.outings[0]
+        self._resolved: list[tuple[OutingSpec, Outing]] = []  # the outings on the shown day, in time order
 
         st = skin_type(settings.skin_type if 1 <= settings.skin_type <= 6 else 2)
         self.site_var = tk.StringVar(value=self.site.label)
-        self.start_var = tk.StringVar(value=settings.start)
-        self.end_var = tk.StringVar(value=settings.end)
+        self.start_var = tk.StringVar()
+        self.end_var = tk.StringVar()
+        self.shade_var = tk.StringVar()
+        self.surface_var = tk.StringVar()
+        self.spf_var = tk.StringVar()
+        self._push_selected()
         self.skin_var = tk.StringVar(value=st.label)
         self.med_var = tk.StringVar(value=f"{settings.med_sed or st.med_sed:g}")
-        self.spf_var = tk.StringVar(value=next((l for l, v in SPF_CHOICES if v == settings.spf), "None"))
+        self.application_var = tk.StringVar(value=choice(APPLICATION_CHOICES, settings.application).label)
         try:
             body = body_exposure(settings.body_key)
         except KeyError:
@@ -158,15 +198,17 @@ class App:
         self.site_box.grid(row=0, column=2, padx=(0, 18))
         self.site_box.bind("<<ComboboxSelected>>", lambda e: self._on_site_change())
         ttk.Label(header, text="Date").grid(row=0, column=3, padx=(0, 6))
-        self.date_ctl = DateControl(header, on_change=lambda d: self._load_day())
+        self.date_ctl = DateControl(header, on_change=lambda d: self._load_day(), max_days_ahead=MAX_DAYS_AHEAD)
         self.date_ctl.grid(row=0, column=4, sticky="w")
         ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel", anchor="e", justify="right",
                   wraplength=260).grid(row=0, column=5, sticky="e", padx=(12, 8))
         ttk.Button(header, text="↻ Refresh", command=lambda: self._load_day(force=True)).grid(row=0, column=6)
 
         # ---------------- sidebar
-        side = ttk.Frame(outer, width=300)
-        side.grid(row=1, column=0, sticky="nsw", padx=(0, 16))
+        # The sidebar scrolls when it's taller than the window (e.g. several outings on a small screen).
+        self.side_scroller = ScrollableFrame(outer, background=self.palette.window, fit_width=True, autohide=True)
+        self.side_scroller.grid(row=1, column=0, sticky="nsw", padx=(0, 16))
+        side = self.side_scroller.inner
         side.columnconfigure(1, weight=1)
         r = 0
 
@@ -185,7 +227,19 @@ class App:
             r += 1
             return lbl
 
+        def field(label: str, var: tk.StringVar, values: list[str], width: int = 26) -> ttk.Combobox:
+            nonlocal r
+            ttk.Label(side, text=label).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 8))
+            box = ttk.Combobox(side, textvariable=var, state="readonly", width=width, values=values)
+            box.grid(row=r, column=1, columnspan=2, sticky="ew", pady=3)
+            box.bind("<<ComboboxSelected>>", lambda e: self._schedule_recompute())
+            r += 1
+            return box
+
         section("Time in the sun")
+        self.outing_list = OutingList(side, self._on_outing_picked)
+        self.outing_list.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        r += 1
         times = ttk.Frame(side)
         times.grid(row=r, column=0, columnspan=3, sticky="w")
         ttk.Label(times, text="Start").grid(row=0, column=0, padx=(0, 6))
@@ -200,8 +254,15 @@ class App:
             side="left", padx=(0, 6))
         ttk.Button(presets, text="Whole day", command=self._whole_day).pack(side="left")
         r += 1
-        hint("Or drag across the chart to pick a window. Click the chart to move just the start. "
-             "The burn and vitamin D times count from the start time.")
+        field("Shade", self.shade_var, [c.label for c in SHADE_CHOICES])
+        field("Ground", self.surface_var, [c.label for c in SURFACE_CHOICES])
+        self.spf_box = field("Sunscreen", self.spf_var, [l for l, _ in SPF_CHOICES])
+        outing_buttons = ttk.Frame(side)
+        outing_buttons.grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.add_btn = ttk.Button(outing_buttons, text="+ Add an outing", command=self._add_outing)
+        self.add_btn.pack(side="left", padx=(0, 6))
+        self.remove_btn = ttk.Button(outing_buttons, text="Remove this one", command=self._remove_outing)
+        r += 1
 
         section("Your skin")
         self.skin_box = ttk.Combobox(side, textvariable=self.skin_var, state="readonly", width=34,
@@ -226,29 +287,24 @@ class App:
         hint(self.med_hint)
 
         section("Sunscreen and vitamin D")
-        ttk.Label(side, text="Sunscreen").grid(row=r, column=0, sticky="w", pady=3)
-        spf_box = ttk.Combobox(side, textvariable=self.spf_var, state="readonly", width=20,
-                               values=[l for l, _ in SPF_CHOICES])
-        spf_box.grid(row=r, column=1, columnspan=2, sticky="ew", pady=3)
-        spf_box.bind("<<ComboboxSelected>>", lambda e: self._schedule_recompute())
-        r += 1
-        ttk.Label(side, text="Skin exposed").grid(row=r, column=0, sticky="w", pady=3, padx=(0, 8))
-        body_box = ttk.Combobox(side, textvariable=self.body_var, state="readonly", width=26,
-                                values=[b.label for b in BODY_EXPOSURES])
-        body_box.grid(row=r, column=1, columnspan=2, sticky="ew", pady=3)
-        body_box.bind("<<ComboboxSelected>>", lambda e: self._schedule_recompute())
-        r += 1
+        field("Applied", self.application_var, [c.label for c in APPLICATION_CHOICES])
+        self.sunscreen_hint = tk.StringVar()
+        hint(self.sunscreen_hint)
+        field("Skin exposed", self.body_var, [b.label for b in BODY_EXPOSURES])
         ttk.Label(side, text="Vitamin D goal").grid(row=r, column=0, sticky="w", pady=3)
         tgt = ttk.Frame(side)
         tgt.grid(row=r, column=1, columnspan=2, sticky="w", pady=3)
-        tspin = ttk.Spinbox(tgt, textvariable=self.target_var, from_=200, to=4000, increment=100, width=7,
-                            command=self._schedule_recompute)
+        # The arrows step through GOAL_STEPS_IU (1,000 to 10,000); any other value can be typed.
+        tspin = ttk.Spinbox(tgt, textvariable=self.target_var, from_=100, to=20000, width=7)
         tspin.pack(side="left")
+        tspin.bind("<<Increment>>", lambda e: self._step_goal(+1))
+        tspin.bind("<<Decrement>>", lambda e: self._step_goal(-1))
         tspin.bind("<Return>", lambda e: self._schedule_recompute())
         tspin.bind("<FocusOut>", lambda e: self._schedule_recompute())
         ttk.Label(tgt, text="IU").pack(side="left", padx=(6, 0))
         r += 1
-        hint("Sunscreen as labelled; most people apply less, so real protection is often lower.")
+        self.goal_hint = tk.StringVar()
+        hint(self.goal_hint)
 
         section("UV data")
         ttk.Radiobutton(side, text="Measured (forecast fills any gaps)", value=Source.BEST.value,
@@ -276,8 +332,9 @@ class App:
         cards.bind("<Configure>", lambda e: self._layout_cards(4 if e.width >= CARDS_ONE_ROW_MIN_WIDTH else 2))
 
         self.note_var = tk.StringVar()
-        ttk.Label(main, textvariable=self.note_var, style="Muted.TLabel", font=f["caption"]).grid(
-            row=1, column=0, sticky="w", pady=(6, 4))
+        note = ttk.Label(main, textvariable=self.note_var, style="Muted.TLabel", font=f["caption"], justify="left")
+        note.grid(row=1, column=0, sticky="ew", pady=(6, 4))
+        main.bind("<Configure>", lambda e: note.configure(wraplength=max(e.width - 8, 200)), add="+")
 
         self.tabs = ttk.Notebook(main)
         self.tabs.grid(row=2, column=0, sticky="nsew")
@@ -323,7 +380,8 @@ class App:
             self._links.append(link)
         ttk.Label(footer, text="Not medical advice. Sunburn can take 16–24 hours to show.",
                   style="Muted.TLabel", font=f["caption"]).pack(side="right")
-        self._update_med_hint()
+        self._update_hints()
+        self._refresh_outing_controls()
 
     def _layout_cards(self, cols: int) -> None:
         """One row of four cards, or a 2 x 2 grid when the window is too narrow for four."""
@@ -340,6 +398,7 @@ class App:
     # ================================================================== theme
 
     def _apply_palette(self) -> None:
+        self.side_scroller.set_background(self.palette.window)
         for card in self.cards.values():
             card.apply_palette(self.palette)
         for link in self._links:
@@ -414,6 +473,8 @@ class App:
             return
         self._request_id += 1
         rid = self._request_id
+        # What was on screen before a Refresh of the same day, to report what's new.
+        before = self.day if force and self.day and self.day.site == site and self.day.day == d else None
         if not quiet:
             self.status_var.set(f"Loading {site.name}…")
 
@@ -421,35 +482,52 @@ class App:
             if rid != self._request_id:
                 return  # a newer request superseded this one
             self.day = data
-            self._on_day_loaded()
+            self._on_day_loaded(before)
 
         def err(exc: Exception) -> None:
             if rid != self._request_id:
                 return
             self._pending_start_now = False
             self.status_var.set(f"⚠ {str(exc).split(' (')[0]}")  # full reason goes on the chart
+            if d == date.today():  # a dropped connection shouldn't stop the live updates: try again later
+                self._schedule_live_refresh()
             if self.day is None or self.day.site != site or self.day.day != d:
                 self.day = None
                 self._show_message(f"Couldn't load UV data: {exc}\nCheck your connection, then press Refresh (F5).")
 
-        self._submit(lambda: self.client.day(site, d, force=force), ok, err)
+        if d > date.today():  # nothing is published ahead: build a clear-sky outlook from today
+            self._submit(lambda: self.client.outlook(site, d, force=force), ok, err)
+        else:
+            self._submit(lambda: self.client.day(site, d, force=force), ok, err)
 
-    def _on_day_loaded(self) -> None:
+    def _schedule_live_refresh(self) -> None:
+        self._later("refresh", AUTO_REFRESH_MS, lambda: self._load_day(quiet=True))
+
+    def _on_day_loaded(self, before: DayData | None = None) -> None:
+        """Show a newly loaded day. ``before`` is what was shown, when this load was a Refresh of that day."""
         day = self.day
         assert day is not None
+        live = not day.is_complete and day.day == date.today()
+        if live:  # readings are still coming in (or haven't started yet)
+            self._schedule_live_refresh()
         if not day.has_data:
             self.status_var.set("")
-            if day.day >= date.today():
+            if day.outlook_from:
+                self._show_message(f"ARPANSA has no clear-sky forecast for {day.site.name} today,\n"
+                                   "so there's nothing to base an outlook on. Try another city.")
+            elif day.day >= date.today():
                 self._show_message(f"No UV data yet for {day.site.name}.\nTry another city.")
             else:
                 self._show_message(f"No UV data for {day.site.name} on this date.\n"
                                    "Records start later at some sites. Try a more recent date or another city.")
             return
         latest = day.latest_measured
-        live = not day.is_complete and day.day == date.today()
-        if live and latest:
+        if before is not None and latest:
+            self.status_var.set(_refresh_summary(before, day))
+        elif live and latest:
             self.status_var.set(f"Live · latest reading {latest.time:%H:%M}")
-            self._later("refresh", AUTO_REFRESH_MS, lambda: self._load_day(quiet=True))
+        elif day.outlook_from:
+            self.status_var.set("Clear-sky outlook")
         elif day.has_measurements:
             self.status_var.set("Measured data")
         else:
@@ -457,7 +535,7 @@ class App:
 
         if self._first_load:
             self._first_load = False
-            if live and latest and latest.time.hour < 18:
+            if live and latest and latest.time.hour < 18 and len(self.outings) == 1:
                 s = latest.time.replace(minute=latest.time.minute - latest.time.minute % 5)
                 self._set_window(s.time(), min(s + timedelta(hours=2), day.end_time).time(), recompute=False)
         if self._pending_start_now and day.day == date.today():
@@ -490,32 +568,57 @@ class App:
             pass
         return self._skin().med_sed
 
-    def _spf(self) -> int:
-        return dict(SPF_CHOICES).get(self.spf_var.get(), 1)
+    def _application(self) -> Choice:
+        label = self.application_var.get()
+        return next((c for c in APPLICATION_CHOICES if c.label == label), choice(APPLICATION_CHOICES,
+                                                                                DEFAULT_APPLICATION))
 
     def _body(self) -> BodyExposure:
         return next((b for b in BODY_EXPOSURES if b.label == self.body_var.get()), BODY_EXPOSURES[1])
 
     def _target_iu(self) -> int:
         try:
-            return max(50, min(int(float(self.target_var.get())), 20000))
+            return max(100, min(int(float(self.target_var.get().replace(",", ""))), 20000))
         except ValueError:
             return 1000
 
-    def _window(self, day: DayData) -> tuple[datetime, datetime]:
+    def _step_goal(self, direction: int) -> str:
+        self.target_var.set(f"{next_goal(self._target_iu(), direction):.0f}")
+        self._schedule_recompute()
+        return "break"  # replaces the spinbox's own stepping
+
+    def _sunscreen_on(self) -> bool:
+        """False when the amount applied is "None": no outing gets its SPF."""
+        return self._application().value > 0
+
+    def _resolve(self, day: DayData) -> list[tuple[OutingSpec, Outing]]:
+        """Place each outing on the shown day, inside the hours that have data, in time order.
+
+        The selected outing's fields show the result, so a time outside the data
+        (e.g. 05:00) visibly snaps to the first reading.
+        """
         first, last = day.first_time, day.end_time
         assert first and last
-        st = parse_time(self.start_var.get()) or time(10)
-        et = parse_time(self.end_var.get()) or time(14)
-        start = max(datetime.combine(day.day, st), first)
-        end = min(datetime.combine(day.day, et), last)
-        if start >= last:
-            start = last - timedelta(minutes=30)
-        if end <= start:
-            end = min(start + timedelta(hours=1), last)
-        self.start_var.set(fmt_clock(start))
-        self.end_var.set(fmt_clock(end))
-        return start, end
+        applied = self._application().value
+        pairs: list[tuple[OutingSpec, Outing]] = []
+        for spec in self.outings:
+            start = max(datetime.combine(day.day, spec.start), first)
+            end = min(datetime.combine(day.day, spec.end), last)
+            if start >= last:
+                start = last - timedelta(minutes=30)
+            if end <= start:
+                end = min(start + timedelta(hours=1), last)
+            if spec is self.sel:
+                spec.start, spec.end = start.time(), end.time()
+                self.start_var.set(fmt_clock(start))
+                self.end_var.set(fmt_clock(end))
+            factor = exposure_factor(choice(SHADE_CHOICES, spec.shade).value,
+                                     choice(SURFACE_CHOICES, spec.surface).value,
+                                     effective_spf(spec.spf, applied))
+            pairs.append((spec, Outing(start, end, factor)))
+        pairs.sort(key=lambda pair: (pair[1].start, pair[1].end))
+        self.outings = [spec for spec, _ in pairs]
+        return pairs
 
     def _set_window(self, start: time, end: time, recompute: bool = True) -> None:
         self.start_var.set(fmt_clock(start))
@@ -551,6 +654,8 @@ class App:
         self._set_window(start.time(), end.time())
 
     def _on_chart_click(self, t: datetime) -> None:
+        if self._on_chart_click_select(t):
+            return
         st, et = parse_time(self.start_var.get()), parse_time(self.end_var.get())
         if st and et and t.time() < et:
             self._set_window(t.time(), et)
@@ -558,6 +663,100 @@ class App:
             length = (datetime.combine(t.date(), et) - datetime.combine(t.date(), st)) if st and et else None
             length = length if length and length > timedelta(0) else timedelta(hours=1)
             self._set_window(t.time(), (t + length).time() if (t + length).date() == t.date() else time(23, 59))
+
+    # ================================================================== outings
+
+    def _push_selected(self) -> None:
+        """Show the selected outing in the sidebar fields."""
+        o = self.sel
+        self.start_var.set(fmt_clock(o.start))
+        self.end_var.set(fmt_clock(o.end))
+        self.shade_var.set(choice(SHADE_CHOICES, o.shade).label)
+        self.surface_var.set(choice(SURFACE_CHOICES, o.surface).label)
+        self.spf_var.set(next((label for label, v in SPF_CHOICES if v == o.spf), SPF_CHOICES[0][0]))
+
+    def _pull_selected(self) -> None:
+        """Copy the sidebar fields into the selected outing."""
+        o = self.sel
+        o.start = parse_time(self.start_var.get()) or o.start
+        o.end = parse_time(self.end_var.get()) or o.end
+        o.shade = next((c.key for c in SHADE_CHOICES if c.label == self.shade_var.get()), o.shade)
+        o.surface = next((c.key for c in SURFACE_CHOICES if c.label == self.surface_var.get()), o.surface)
+        o.spf = dict(SPF_CHOICES).get(self.spf_var.get(), o.spf)
+
+    def _select_outing(self, spec: OutingSpec) -> None:
+        if spec is self.sel:
+            return
+        self._pull_selected()
+        self.sel = spec
+        self._push_selected()
+        self._recompute()
+
+    def _on_outing_picked(self, index: int) -> None:
+        if 0 <= index < len(self.outings):
+            self._select_outing(self.outings[index])
+
+    def _add_outing(self) -> None:
+        if len(self.outings) >= MAX_OUTINGS:
+            return
+        self._pull_selected()
+        start, end = self._free_slot()
+        spec = self.sel.copy_conditions(start, end)  # same shade, ground and sunscreen as the selected one
+        self.outings.append(spec)
+        self.outings.sort(key=lambda o: (o.start, o.end))
+        self.sel = spec
+        self._push_selected()
+        self._refresh_outing_controls()
+        self._recompute()
+
+    def _remove_outing(self) -> None:
+        if len(self.outings) < 2:
+            return
+        i = self.outings.index(self.sel)
+        self.outings.pop(i)
+        self.sel = self.outings[min(i, len(self.outings) - 1)]
+        self._push_selected()
+        self._refresh_outing_controls()
+        self._recompute()
+
+    def _free_slot(self, length: timedelta = timedelta(minutes=30)) -> tuple[time, time]:
+        """Times for a new outing: an hour after the last one, else before the first, else in the widest gap."""
+        d = self.date_ctl.value
+        if self.day and self.day.first_time and self.day.end_time:
+            lo, hi = self.day.first_time, self.day.end_time
+        else:
+            lo, hi = datetime.combine(d, time(6)), datetime.combine(d, time(20))
+        spans = sorted((max(datetime.combine(d, o.start), lo), min(datetime.combine(d, o.end), hi))
+                       for o in self.outings)
+        gap = timedelta(hours=1)
+        after = _round_up_5(spans[-1][1] + gap)
+        if after + length <= hi:
+            return after.time(), (after + length).time()
+        before = _round_down_5(spans[0][0] - gap - length)
+        if before >= lo:
+            return before.time(), (before + length).time()
+        gaps = list(zip([lo] + [e for _, e in spans], [s for s, _ in spans] + [hi]))
+        g0, g1 = max(gaps, key=lambda g: g[1] - g[0])
+        start = _round_down_5(max(g0 + (g1 - g0 - length) / 2, g0))
+        return start.time(), min(start + length, hi).time()
+
+    def _refresh_outing_controls(self) -> None:
+        many = len(self.outings) > 1
+        if many:
+            self.outing_list.grid()
+            self.remove_btn.pack(side="left")
+        else:
+            self.outing_list.grid_remove()
+            self.remove_btn.pack_forget()
+        self.add_btn.state(["disabled"] if len(self.outings) >= MAX_OUTINGS else ["!disabled"])
+
+    def _on_chart_click_select(self, t: datetime) -> bool:
+        """A click inside another outing selects it. Returns True if it did."""
+        for spec, o in self._resolved:
+            if spec is not self.sel and o.start <= t < o.end:
+                self._select_outing(spec)
+                return True
+        return False
 
     def _on_skin_change(self) -> None:
         self.med_var.set(f"{self._skin().med_sed:g}")
@@ -572,6 +771,26 @@ class App:
             self.skin_var.set(st.label)
             self._on_skin_change()
             self.status_var.set(f"Skin type set to Type {st.roman}")
+
+    def _update_hints(self) -> None:
+        self._update_med_hint()
+        self._sync_spf_field()
+        self.sunscreen_hint.set("Most people apply half the tested amount or less." if self._sunscreen_on()
+                                else "Sunscreen is off for every outing.")
+        self.goal_hint.set(f"Up to about {most_before_burning(self._body().fraction):,.0f} IU before you burn.")
+
+    def _sync_spf_field(self) -> None:
+        """While sunscreen is off, the Sunscreen field says so (and is locked); each outing keeps its SPF."""
+        spf_labels = dict(SPF_CHOICES)
+        if self._sunscreen_on():
+            if self.spf_var.get() not in spf_labels:
+                self.spf_var.set(next((label for label, v in SPF_CHOICES if v == self.sel.spf), SPF_CHOICES[0][0]))
+            self.spf_box.state(["!disabled"])
+        else:
+            if self.spf_var.get() != SPF_OFF_LABEL:
+                self.sel.spf = spf_labels.get(self.spf_var.get(), self.sel.spf)
+                self.spf_var.set(SPF_OFF_LABEL)
+            self.spf_box.state(["disabled"])
 
     def _update_med_hint(self) -> None:
         st = self._skin()
@@ -588,152 +807,198 @@ class App:
         self._later("recompute", 120, self._recompute)
 
     def _recompute(self) -> None:
-        self._update_med_hint()
+        self._update_hints()
+        self._pull_selected()
         day = self.day
         if not day or not day.has_data:
+            self._fill_outing_list(None, 0)
             return
         source = Source(self.source_var.get())
         series = build_series(day, source)
-        start, end = self._window(day)
-        skin, med, spf, body, target = self._skin(), self._med(), self._spf(), self._body(), self._target_iu()
-
-        wd = window_dose(series, start, end)
-        eff = wd.sed / spf
-        rating = rate_dose(eff, med)
-        plan = plan_exposure(series, start, med_sed=med, spf=spf, target_iu=target, body_fraction=body.fraction)
-        self._last_plan = plan
+        pairs = self._resolve(day)
+        self._resolved = pairs
+        skin, med, body, target = self._skin(), self._med(), self._body(), self._target_iu()
+        plan = plan_day(series, [o for _, o in pairs], med_sed=med, target_iu=target, body_fraction=body.fraction)
+        selected = self.outings.index(self.sel)
+        protection = sun_protection_times(series)
         clear = None
-        if source is Source.BEST and day.has_forecast and wd.minutes > wd.forecast_minutes:
+        if source is Source.BEST and day.has_forecast and plan.minutes > plan.forecast_minutes:
             clear_series = build_series(day, Source.CLEAR_SKY)
-            clear = (clear_series, window_dose(clear_series, start, end))
+            clear = (clear_series, sum(window_dose(clear_series, o.start, o.end).sed for o in plan.outings))
 
-        self._fill_cards(day, series, start, end, wd, eff, rating, plan, clear, skin, med, spf, body, target)
-        self._fill_note(day, source, wd)
-        self._fill_chart(day, series, source, start, end, spf, med, plan, clear)
-        self._fill_table(series, start, end, spf)
+        self._fill_outing_list(plan, selected)
+        self._fill_cards(series, source, plan, protection, clear, skin, med, body, target)
+        self._fill_note(day, source, plan)
+        self._fill_chart(day, series, source, plan, selected, protection, clear, med)
+        self._fill_table(series, plan)
         self._save_settings_soon()
 
-    def _fill_cards(self, day, series, start, end, wd, eff, rating, plan: SunPlan, clear, skin, med, spf, body,
-                    target) -> None:
+    def _fill_outing_list(self, plan: DayPlan | None, selected: int) -> None:
+        if plan is None:  # no data for the day: list the outings as set, without doses
+            self.outings.sort(key=lambda o: (o.start, o.end))
+            rows = [(f"{o.start:%H:%M}–{o.end:%H:%M}", o.conditions(self._sunscreen_on()), "–")
+                    for o in self.outings]
+            selected = self.outings.index(self.sel)
+        else:
+            rows = [(f"{o.start:%H:%M}–{o.end:%H:%M}", spec.conditions(self._sunscreen_on()), f"{dose:.2f} SED")
+                    for (spec, o), dose in zip(self._resolved, plan.skin_doses)]
+        self.outing_list.set_rows(rows, selected)
+        self._refresh_outing_controls()
+
+    def _adjustment_words(self) -> str:
+        words = []
+        if any(o.shade != "sun" for o in self.outings):
+            words.append("shade")
+        if any(o.surface != "ground" for o in self.outings):
+            words.append("reflection")
+        if self._sunscreen_on() and any(o.spf > 1 for o in self.outings):
+            words.append("sunscreen")
+        return ", ".join(words[:-1]) + (" and " if len(words) > 1 else "") + words[-1] if words else ""
+
+    def _fill_cards(self, series, source, plan: DayPlan, protection: ProtectionTimes | None, clear, skin, med,
+                    body, target) -> None:
         p = self.palette
-        span = f"{start:%H:%M}–{end:%H:%M}"
+        many = len(plan.outings) > 1
+        first, last = plan.outings[0], plan.outings[-1]
+        span = f"{len(plan.outings)} outings" if many else f"{first.start:%H:%M}–{first.end:%H:%M}"
+        sun = fmt_duration(plan.sun_time)
+        dose_span = f"{span}, {sun}" if many else span
+        rating = rate_dose(plan.skin_sed, med)
 
         # ---- dose
-        line1 = f"{wd.joules_per_m2:,.0f} J/m² over {fmt_duration(wd.duration)}"
-        if spf > 1:
-            line1 += f" · {eff:.2f} SED on skin with SPF {spf}"
+        if abs(plan.skin_sed - plan.ambient_sed) > 0.005:
+            line1 = f"≈{plan.skin_sed:.2f} SED on your skin after {self._adjustment_words()}"
+        else:
+            line1 = f"{plan.ambient_sed * 100:,.0f} J/m²" + (" in total" if many else f" over {sun}")
         extra = [rating.advice]
-        if clear and clear[1].sed > 0.05:
-            ratio = wd.sed / clear[1].sed
+        if clear and clear[1] > 0.05:
+            ratio = plan.ambient_sed / clear[1]
             if ratio < 0.95:
-                extra.append(f"Cloud cut this by {1 - ratio:.0%} (clear sky: {clear[1].sed:.1f} SED).")
+                extra.append(f"Cloud cut this by {1 - ratio:.0%} (clear sky: {clear[1]:.1f} SED).")
             elif ratio > 1.05:
-                extra.append(f"{ratio - 1:.0%} above the clear-sky forecast ({clear[1].sed:.1f} SED).")
+                extra.append(f"{ratio - 1:.0%} above the clear-sky forecast ({clear[1]:.1f} SED).")
             else:
                 extra.append("About the same as a clear-sky day.")
-        if wd.forecast_minutes and Source(self.source_var.get()) is Source.BEST:
-            extra.append(f"{wd.forecast_minutes} min from the clear-sky forecast.")
+        if plan.forecast_minutes and source is Source.BEST and plan.forecast_minutes < plan.minutes:
+            extra.append(f"{plan.forecast_minutes} min from the clear-sky forecast.")
         self.cards["dose"].show(
-            f"{wd.sed:.2f}", "SED", line1,
+            f"{plan.ambient_sed:.2f}", "SED", line1,
             f"{rating.label} · {rating.fraction_of_med:.0%} of your burn threshold",
             " ".join(extra), color=status_color(p, rating.level), icon=LEVEL_ICON[rating.level],
-            title=f"UV dose · {span}",
+            title=f"UV dose · {dose_span}",
         )
 
         # ---- burn
-        who = f"Type {skin.roman}, {med:g} SED" + (f", SPF {spf}" if spf > 1 else "")
-        fc_note = "Includes clear-sky forecast; cloud would make it later." if plan.relies_on_forecast else ""
-        if plan.burn_at:
-            inside = plan.burn_at <= end
+        who = f"Type {skin.roman}, {med:g} SED"
+        notes = []
+        if plan.relies_on_forecast:
+            notes.append("Includes clear-sky forecast; cloud would make it later.")
+        title = "Time to burn · time in the sun" if many else f"Time to burn · from {first.start:%H:%M}"
+        b = plan.burn
+        if b:
+            inside = b.outing is not None
+            where = f", in your {plan.outings[b.outing].start:%H:%M} outing" if many and inside else ""
+            if inside:
+                advice = ("Cover up or find shade by then." if many
+                          else "Inside your window: cover up or find shade by then.")
+            else:
+                advice = f"Your {'last outing' if many else 'window'} ends {fmt_duration(b.at - last.end)} before that."
+            if (self._sunscreen_on() and any(o.spf > 1 for o in self.outings)
+                    and b.sun_time > timedelta(hours=REAPPLY_HOURS)):
+                notes.append(f"Reapply sunscreen every {REAPPLY_HOURS} hours.")
             self.cards["burn"].show(
-                fmt_duration(plan.burn_after), "", f"Burn threshold at {plan.burn_at:%H:%M} ({who})",
-                "Inside your window: cover up or find shade by then."
-                if inside else f"Your window ends {fmt_duration(plan.burn_at - end)} before that.",
-                fc_note, color=p.critical if inside else p.good,
-                icon=LEVEL_ICON["very_high"] if inside else LEVEL_ICON["low"],
-                title=f"Time to burn · from {start:%H:%M}",
+                fmt_duration(b.sun_time), "", f"Burn threshold at {b.at:%H:%M}{where} ({who})", advice,
+                " ".join(notes), color=p.critical if inside else p.good,
+                icon=LEVEL_ICON["very_high"] if inside else LEVEL_ICON["low"], title=title,
             )
         else:
             self.cards["burn"].show(
-                "Not today", "", f"Only {plan.dose_available:.1f} SED left after {start:%H:%M} ({who})",
-                "Stays under your burn threshold for the rest of the day.", fc_note,
-                color=p.good, icon=LEVEL_ICON["low"], title=f"Time to burn · from {start:%H:%M}",
+                "Not today", "", f"At most {plan.dose_available:.1f} SED on your skin ({who})",
+                "Stays under your burn threshold for the rest of the day.", " ".join(notes),
+                color=p.good, icon=LEVEL_ICON["low"], title=title,
             )
 
         # ---- vitamin D
         body_short = body.label.split(" (")[0].lower()
-        window_iu = vitamin_d_iu(eff, med, body.fraction)
-        capped = eff >= med * PLATEAU_MED
-        line3 = f"Whole window: ≈{window_iu:,.0f} IU" + (" (production levels off)." if capped else ".")
+        capped = plan.skin_sed >= med * PLATEAU_MED
+        line3 = (f"{'All outings' if many else 'Whole window'}: ≈{plan.vitd_iu:,.0f} IU"
+                 + (" (production levels off)." if capped else "."))
+        title = "Vitamin D · time in the sun" if many else f"Vitamin D · from {first.start:%H:%M}"
+        v = plan.vitd
         if plan.vitd_dose_sed is None:
             self.cards["vitd"].show(
                 "Not safely", "", f"{target:,} IU would take more than a burning dose on {body_short}.",
-                "Expose more skin rather than staying out longer.", line3,
-                color=p.warning, icon=LEVEL_ICON["moderate"], title=f"Vitamin D · from {start:%H:%M}",
+                f"The most before burning is ≈{most_before_burning(body.fraction):,.0f} IU. "
+                "Expose more skin or lower the goal.", line3,
+                color=p.warning, icon=LEVEL_ICON["moderate"], title=title,
             )
-        elif plan.vitd_at:
-            margin = (f"Sweet spot, well before your burn time ({fmt_duration(plan.burn_after)})."
-                      if plan.burn_after else "Sweet spot, with no burn risk today.")
+        elif v:
+            where = f", in your {plan.outings[v.outing].start:%H:%M} outing" if many and v.outing is not None else ""
+            margin = (f"Sweet spot: before your burn time ({fmt_duration(plan.burn.sun_time)})." if plan.burn
+                      else "Sweet spot, with no burn risk today.")
             self.cards["vitd"].show(
-                fmt_duration(plan.vitd_after), "", f"≈{target:,} IU by {plan.vitd_at:%H:%M} with {body_short}",
+                fmt_duration(v.sun_time), "", f"≈{target:,} IU by {v.at:%H:%M} with {body_short}{where}",
                 margin, "After that, more sun mostly adds UV damage. " + line3,
-                color=p.good, icon=LEVEL_ICON["low"], title=f"Vitamin D · from {start:%H:%M}",
+                color=p.good, icon=LEVEL_ICON["low"], title=title,
             )
         else:
             possible = vitamin_d_iu(plan.dose_available, med, body.fraction)
             self.cards["vitd"].show(
-                "Not today", "", f"UV after {start:%H:%M} is too weak to reach {target:,} IU",
-                f"About {possible:,.0f} IU possible with {body_short}. Try an earlier start.", line3,
-                color=p.warning, icon=LEVEL_ICON["moderate"], title=f"Vitamin D · from {start:%H:%M}",
+                "Not today", "",
+                f"Too little UV reaches your skin in these outings for {target:,} IU" if many
+                else f"Too little UV reaches your skin after {first.start:%H:%M} for {target:,} IU",
+                f"About {possible:,.0f} IU possible with {body_short}. "
+                + ("Try longer or earlier outings." if many else "Try an earlier start."), line3,
+                color=p.warning, icon=LEVEL_ICON["moderate"], title=title,
             )
 
-        # ---- UV
-        cat = uv_category(wd.peak_uvi)
-        protect = [pt.time for pt in series if pt.uvi >= 2.5]
-        prot_line = (f"UV 3+ today: {protect[0]:%H:%M}–{protect[-1] + ONE_MINUTE:%H:%M}" if protect
-                     else "UV stays below 3 all day.")
-        self.cards["uv"].show(
-            f"{wd.peak_uvi:.1f}", cat.name,
-            f"at {wd.peak_time:%H:%M} · average {wd.mean_uvi:.1f}" if wd.peak_time else "No readings",
-            cat.advice, prot_line, color=cat.color, icon="●", title=f"Peak UV · {span}",
-        )
-
-    def _fill_note(self, day: DayData, source: Source, wd) -> None:
-        latest = day.latest_measured
-        if source is Source.CLEAR_SKY:
-            self.note_var.set("Showing ARPANSA's clear-sky forecast: the most UV a cloudless day would bring.")
-        elif not day.has_measurements:
-            self.note_var.set("No measurements for this day, so ARPANSA's clear-sky forecast is used: "
-                              "the most UV a cloudless day would bring.")
-        elif not day.is_complete and latest and day.day == date.today():
-            self.note_var.set(
-                f"Measured by ARPANSA until {latest.time:%H:%M}. After that the clear-sky forecast is used, "
-                "so real UV may be lower if cloud comes over.")
-        elif wd.forecast_minutes:
-            self.note_var.set(f"{wd.forecast_minutes} minutes in this window have no measurement, "
-                              "so ARPANSA's clear-sky forecast fills them.")
-        elif wd.missing_minutes:
-            self.note_var.set(f"{wd.missing_minutes} minutes in this window have no data and count as zero.")
+        # ---- UV and sun protection times
+        prot = (f"Sun protection {protection.start:%H:%M}–{protection.end:%H:%M}" if protection
+                else "UV under 3 all day")
+        title = "Peak UV · your outings" if many else f"Peak UV · {span}"
+        pk = plan.peak
+        if pk and pk.peak_time:
+            cat = uv_category(pk.peak_uvi)
+            self.cards["uv"].show(
+                f"{pk.peak_uvi:.1f}", cat.name, f"at {pk.peak_time:%H:%M} · average {plan.mean_uvi:.1f}",
+                prot, cat.advice, color=cat.color, icon="●", title=title,
+            )
         else:
-            self.note_var.set(f"Measured by ARPANSA at {day.site.name}, one reading per minute.")
+            self.cards["uv"].show("–", "", "No readings", prot, title=title)
 
-    def _fill_chart(self, day, series: list[UVPoint], source, start, end, spf, med, plan: SunPlan, clear) -> None:
+    def _fill_note(self, day: DayData, source: Source, plan: DayPlan) -> None:
         latest = day.latest_measured
-        live = not day.is_complete and latest is not None
-        curve = cumulative_curve(series, start, end, spf)
-        tail: tuple[list, list] = ([], [])
-        if end < day.end_time:
-            tt, tv = cumulative_curve(series, end, day.end_time, spf)
-            base = curve[1][-1]
-            tail = (tt, [base + v for v in tv])
-        clear_curve = cumulative_curve(clear[0], start, end, spf) if clear else ([], [])
+        if day.outlook_from:
+            note = (f"Outlook: ARPANSA's clear-sky forecast for today ({day.outlook_from:%a %d %b}), "
+                    "used as a stand-in for this day. Cloud would make real UV lower.")
+        elif source is Source.CLEAR_SKY:
+            note = "Showing ARPANSA's clear-sky forecast: the most UV a cloudless day would bring."
+        elif not day.has_measurements:
+            note = ("No measurements for this day, so ARPANSA's clear-sky forecast is used: "
+                    "the most UV a cloudless day would bring.")
+        elif not day.is_complete and latest and day.day == date.today():
+            note = (f"Measured by ARPANSA until {latest.time:%H:%M}. After that the clear-sky forecast is used, "
+                    f"so real UV may be lower if cloud comes over. New readings load every "
+                    f"{AUTO_REFRESH_MS // 60_000} minutes.")
+        elif plan.forecast_minutes:
+            note = (f"{plan.forecast_minutes} minutes in {'your outings' if len(plan.outings) > 1 else 'this window'}"
+                    " have no measurement, so ARPANSA's clear-sky forecast fills them.")
+        elif plan.missing_minutes:
+            note = f"{plan.missing_minutes} minutes have no data and count as zero."
+        else:
+            note = f"Measured by ARPANSA at {day.site.name}, one reading per minute."
+        if plan.overlapped:
+            note += " Some outings overlap; the shared minutes count once."
+        self.note_var.set(note)
 
-        # prefix sums for the hover readout
-        index = {pt.time: i for i, pt in enumerate(series)}
-        prefix = [0.0]
-        for pt in series:
-            prefix.append(prefix[-1] + minute_dose(pt.uvi, spf))
-        start_i = index.get(start, 0 if start <= series[0].time else len(series))
+    def _fill_chart(self, day, series: list[UVPoint], source, plan: DayPlan, selected: int,
+                    protection: ProtectionTimes | None, clear, med) -> None:
+        latest = day.latest_measured
+        live = not day.is_complete and latest is not None and day.day == date.today()
+        curve, tail = plan_curves(series, plan.outings)
+        clear_curve = plan_curves(clear[0], plan.outings)[0] if clear else ([], [])
+        many = len(plan.outings) > 1
+        first, last_end = plan.outings[0].start, plan.outings[-1].end
         samples = {s.time: s for s in day.samples}
 
         def describe(t: datetime) -> str:
@@ -745,13 +1010,17 @@ class App:
                 parts.append(f"UV {s.measured:.1f} ({uv_category(s.measured).name.lower()})")
             if s.forecast is not None:
                 parts.append(f"clear sky {s.forecast:.1f}")
-            if t > start and t in index:
-                dose = prefix[index[t]] - prefix[start_i]  # dose from start up to time t
-                parts.append(f"{dose:.2f} SED on skin since {start:%H:%M}")
+            if t > first:
+                in_plan = t <= last_end
+                dose = value_at(curve if in_plan else tail, t)
+                if dose is not None:
+                    since = f"since {first:%H:%M}" if not many else ("so far" if in_plan else "if you stayed out")
+                    parts.append(f"{dose:.2f} SED on skin {since}")
             return "  ·  ".join(parts)
 
+        title = f"{day.site.name} · {day.day:%a %d %b %Y}" + (" · clear-sky outlook" if day.outlook_from else "")
         self.chart.render(ChartView(
-            title=f"{day.site.name} · {day.day:%a %d %b %Y}",
+            title=title,
             day_start=day.first_time,
             day_end=day.end_time,
             times=[s.time for s in day.samples],
@@ -759,22 +1028,23 @@ class App:
             forecast=[s.forecast for s in day.samples],
             show_measured=source is Source.BEST and day.has_measurements,
             latest_reading=latest.time if live else None,
-            window_start=start,
-            window_end=end,
+            outings=[(o.start, o.end) for _, o in self._resolved],
+            selected=selected,
+            protection=(protection.start, protection.end) if protection else None,
             curve=curve,
             tail=tail,
             clear_curve=clear_curve,
-            dose_label="Dose on your skin" + (f" (SPF {spf})" if spf > 1 else ""),
             med_sed=med,
             vitd_sed=plan.vitd_dose_sed,
-            burn_at=plan.burn_at,
-            vitd_at=plan.vitd_at,
+            burn_at=plan.burn.at if plan.burn else None,
+            vitd_at=plan.vitd.at if plan.vitd else None,
             describe=describe,
+            **({"hint": "Drag to set times · click an outing to edit it"} if many else {}),
         ))
 
-    def _fill_table(self, series, start, end, spf) -> None:
+    def _fill_table(self, series, plan: DayPlan) -> None:
         self.table.delete(*self.table.get_children())
-        rows = hourly_breakdown(series, start, end)
+        rows = plan_hours(series, plan.outings)
         self._hour_rows = rows
         for row in rows:
             notes = []
@@ -784,14 +1054,20 @@ class App:
                 notes.append(f"no data {row.missing_minutes} min")
             self.table.insert("", "end", values=(
                 f"{row.start:%H:%M}–{row.end:%H:%M}", f"{row.mean_uvi:.1f}", f"{row.peak_uvi:.1f}",
-                f"{row.sed:.2f}", f"{row.cumulative_sed:.2f}", f"{row.cumulative_sed / spf:.2f}",
+                f"{row.sed:.2f}", f"{row.cumulative_sed:.2f}", f"{row.skin_cumulative_sed:.2f}",
                 "   " + (", ".join(notes) or "measured"),
             ))
-        total = rows[-1].cumulative_sed if rows else 0.0
-        self.table_caption.set(
-            f"{self.site.name}, {start:%d/%m/%Y} {start:%H:%M}–{end:%H:%M}: {total:.2f} SED in total "
-            f"({total * 100:,.0f} J/m²). Partial hours at the edges of the window."
-        )
+        total = plan.ambient_sed
+        first, last = plan.outings[0], plan.outings[-1]
+        if len(plan.outings) > 1:
+            what = (f"{first.start:%d/%m/%Y}, {len(plan.outings)} outings "
+                    f"({fmt_duration(plan.sun_time)} in the sun)")
+            edges = "Rows are clock hours within each outing."
+        else:
+            what = f"{first.start:%d/%m/%Y} {first.start:%H:%M}–{last.end:%H:%M}"
+            edges = "Partial hours at the edges of the window."
+        self.table_caption.set(f"{self.site.name}, {what}: {total:.2f} SED in total ({total * 100:,.0f} J/m²). "
+                               f"{edges}")
 
     # ================================================================== misc actions
 
@@ -801,12 +1077,13 @@ class App:
             return
         buf = io.StringIO()
         w = csv.writer(buf, lineterminator="\n")
-        w.writerow(["site", "date", "from", "to", "minutes", "mean_uvi", "peak_uvi", "dose_sed",
-                    "running_total_sed", "forecast_minutes", "missing_minutes"])
+        w.writerow(["site", "date", "outing", "from", "to", "minutes", "mean_uvi", "peak_uvi", "dose_sed",
+                    "running_total_sed", "on_skin_running_total_sed", "forecast_minutes", "missing_minutes"])
         for r in self._hour_rows:
-            w.writerow([self.site.name, r.start.date().isoformat(), f"{r.start:%H:%M}", f"{r.end:%H:%M}",
-                        r.minutes, f"{r.mean_uvi:.2f}", f"{r.peak_uvi:.2f}", f"{r.sed:.3f}",
-                        f"{r.cumulative_sed:.3f}", r.forecast_minutes, r.missing_minutes])
+            w.writerow([self.site.name, r.start.date().isoformat(), r.outing + 1, f"{r.start:%H:%M}",
+                        f"{r.end:%H:%M}", r.minutes, f"{r.mean_uvi:.2f}", f"{r.peak_uvi:.2f}", f"{r.sed:.3f}",
+                        f"{r.cumulative_sed:.3f}", f"{r.skin_cumulative_sed:.3f}", r.forecast_minutes,
+                        r.missing_minutes])
         self.root.clipboard_clear()
         self.root.clipboard_append(buf.getvalue())
         self.status_var.set("Table copied as CSV")
@@ -860,17 +1137,39 @@ class App:
         s.skin_type = self._skin().number
         med = self._med()
         s.med_sed = None if abs(med - self._skin().med_sed) < 1e-9 else med
-        s.spf = self._spf()
         s.body_key = self._body().key
         s.target_iu = self._target_iu()
+        s.application = self._application().key
         s.source = self.source_var.get()
         s.dark = self.dark_var.get()
-        s.start, s.end = self.start_var.get(), self.end_var.get()
+        self._pull_selected()
+        s.outings = [o.to_dict() for o in self.outings]
         s.save()
 
     def _on_close(self) -> None:
         self._save_settings()
         self.root.destroy()
+
+
+def _refresh_summary(before: DayData, after: DayData) -> str:
+    """Status after a Refresh: how many new readings came in, or that there were none."""
+    prev = before.latest_measured
+    latest = after.latest_measured
+    assert latest is not None
+    new = sum(1 for s in after.samples if s.measured is not None and (prev is None or s.time > prev.time))
+    if not new:
+        return f"Up to date · latest reading {latest.time:%H:%M}"
+    return f"{new} new reading{'' if new == 1 else 's'} · latest {latest.time:%H:%M}"
+
+
+def _round_up_5(t: datetime) -> datetime:
+    t = t.replace(second=0, microsecond=0)
+    return t + timedelta(minutes=-t.minute % 5)
+
+
+def _round_down_5(t: datetime) -> datetime:
+    t = t.replace(second=0, microsecond=0)
+    return t - timedelta(minutes=t.minute % 5)
 
 
 DISCLAIMER_TEXT = """
@@ -903,19 +1202,39 @@ The questionnaire is ARPANSA's Fitzpatrick skin phototype sheet: 10 questions sc
 The burn threshold (minimal erythemal dose, MED) defaults to 2, 2.5, 3, 4.5, 6 and 10 SED for Types I–VI. This is a widely used reference set at or near the cautious end of published ranges. Individuals vary, so you can override it.
 
 ## Time to burn
-This is the time from your start until the dose on your skin reaches your burn threshold, following the real UV curve rather than assuming constant UV. Sunscreen divides the dose by its SPF. SPF ratings assume a thick layer (2 mg/cm²); most people apply far less, so real protection is often much lower than the label.
+This is the time in the sun from your start until the dose on your skin reaches your burn threshold, following the real UV curve rather than assuming constant UV. If that doesn't happen within your window, the app carries on as if you stayed out, to show how much longer you could stay.
+
+## Several outings
+Sunburn and vitamin D depend on the total dose over the day, so "+ Add an outing" lets you plan a day in pieces, such as a morning walk and a lunch break. The doses add up. The burn and vitamin D times then count only the time spent outside, and say which outing they fall in. Each outing has its own shade, ground and sunscreen. Pick one in the list, or click it on the chart, to edit it. If outings overlap, the shared minutes count once.
+
+## Shade, ground and sunscreen
+ARPANSA measures UV on a flat, open sensor. Each outing's conditions scale that dose:
+    dose on skin = ambient dose × (shade + reflection) ÷ effective SPF
+Shade blocks the direct sun but not UV scattered from the open sky, which is roughly half the total in summer around midday. Patchy shade counts as 0.75 and good shade as 0.5 (the cautious end; good shade can cut UV by up to 75%).
+Reflection from the ground adds UV, mostly to your face, neck and the underside of your arms. Following the WHO's typical figures, water adds 10%, beach sand 15% and fresh snow 80%. Grass, soil and paving reflect under 10% and count as zero. Shade overhead doesn't stop reflection from the sunlit ground around you, so it is added rather than reduced.
+SPF ratings assume a thick layer (2 mg/cm², about a teaspoon per limb). Most people apply half to a quarter of that. The app takes protection to drop in proportion: SPF 30 applied at half thickness acts like SPF 15.5. Some studies find it drops faster, so if you burn easily treat these as best cases. Sunscreen also wears off with sweat, swimming and towelling, so reapply every 2 hours.
+Setting "Applied" to None turns sunscreen off for every outing, which is a quick way to see what going without would mean. Each outing keeps its SPF for when you turn it back on.
+These are rough, typical figures, not measurements of your spot.
+
+## Sun protection times
+Cancer Council and ARPANSA recommend sun protection whenever the UV Index is 3 or above. The chart marks that part of the day along the bottom of the UV panel, and the Peak UV card gives the times. They come from the UV data shown, so on a cloudy day they reflect what was measured.
+
+## Tomorrow's outlook
+ARPANSA publishes nothing ahead of time. Press ▶ past today to get a clear-sky outlook for tomorrow, made from today's clear-sky forecast. A clear-sky curve barely changes from one day to the next. The outlook allows for daylight saving starting or ending. It shows a cloudless day, so it is a cautious guide for sunburn and an optimistic one for vitamin D.
 
 ## Vitamin D
 This uses Holick's rule of thumb, as adopted by Webb & Engelsen (2006): exposing about a quarter of the body (face, arms and hands) to a quarter of your burn threshold makes roughly 1000 IU. In general:
     IU ≈ 16,000 × (fraction of skin exposed) × (dose / burn threshold), capped at 1 burn-threshold dose.
 Vitamin D production levels off with continued exposure, so short, regular exposure beats long sessions. The "sweet spot" is the time needed to reach your goal. Beyond it, extra sun mostly adds UV damage.
-Caveats: the model treats erythemal UV as a stand-in for vitamin-D-producing UV. That overstates production when the sun is low (early, late and in winter). It ignores age, body size and diet. Daily goals of 600–1000 IU are commonly used.
+Caveats: the model treats erythemal UV as a stand-in for vitamin-D-producing UV. That overstates production when the sun is low (early, late and in winter). It ignores age, body size and diet.
+Choosing a goal: the default of 1,000 IU is Webb & Engelsen's "standard vitamin D dose" for sun exposure. Official intake guidelines are lower: 200–600 IU a day in Australia and New Zealand, rising with age, and 600–800 IU in the US. The Endocrine Society's 2011 guideline suggested 1,500–2,000 IU for adults to keep blood levels up, but its 2024 update no longer advises more than the official amounts for healthy adults under 75. The goal's arrows step from 1,000 to 10,000 IU, and you can type any other value.
+Higher goals need more bare skin rather than more time. The most a day can make before you burn is about 16,000 IU × the fraction of skin exposed: about 4,000 IU with face, arms and hands, and about 13,600 IU in swimwear. The skin can't make too much vitamin D, because production levels off, but UV damage keeps adding up. Vitamin D also lasts for weeks in the body, so a good dose on some days covers days with less.
 
 ## Measured vs clear-sky forecast
-"Measured" uses ARPANSA's readings, and for any minute without one (for example later today) it uses ARPANSA's clear-sky forecast. "Clear-sky forecast" shows the most UV a cloudless day would bring. That is a cautious figure for sunburn and an optimistic one for vitamin D.
+"Measured" uses ARPANSA's readings, and for any minute without one (for example later today) it uses ARPANSA's clear-sky forecast. While today's readings are coming in, the app loads new ones every 2 minutes. Press Refresh (F5) to load them straight away; the status at the top then says how many came in. "Clear-sky forecast" shows the most UV a cloudless day would bring. That is a cautious figure for sunburn and an optimistic one for vitamin D.
 
-## Sun protection
-Cancer Council and ARPANSA recommend sun protection whenever the UV Index is 3 or above. Sunburn can take 16–24 hours to show fully.
+## Sunburn
+Sunburn can take 16–24 hours to show fully.
 """
 
 
