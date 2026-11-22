@@ -31,7 +31,8 @@ Needs Python 3.13+ (with Tk, which the python.org and uv builds include).
 - **Tomorrow's outlook.** ARPANSA publishes nothing ahead, so the ▶ button past today
   gives a clear-sky outlook for tomorrow made from today's clear-sky forecast. It
   allows for daylight saving changes.
-- **Dose in SED** (Standard Erythemal Dose, 100 J/m²) for the window. It is rated
+- **Dose in SED** (Standard Erythemal Dose, 100 J/m²) on your skin for the window,
+  after shade, reflection and sunscreen, beside ARPANSA's open-sun dose. It is rated
   against your burn threshold and compared with the clear-sky forecast, so you can
   see how much cloud cut it.
 - **Two-panel chart:** the UV Index over the day (measured vs clear-sky forecast,
@@ -43,7 +44,8 @@ Needs Python 3.13+ (with Tk, which the python.org and uv builds include).
 - **Vitamin D timing:** how long from your start time to reach a goal of 1,000 to
   10,000 IU (or any amount you type) for the skin you expose. It is the "sweet spot"
   before extra sun mostly adds damage, and the app says when a goal needs more bare
-  skin than you have chosen.
+  skin than you have chosen. It also gives the most you could make that day, as a
+  range because people differ, and the time you'd reach it (your burn time).
 - **Hourly table**, which you can copy as CSV. There is also a dark theme, and your
   settings are remembered (in `%APPDATA%\uv-dose\settings.json` on Windows).
 

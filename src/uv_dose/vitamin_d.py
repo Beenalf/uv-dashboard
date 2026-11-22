@@ -8,6 +8,11 @@ exposure, which sits inside the 10,000-25,000 IU often quoted for 1 MED.
 
     IU ~ 16,000 x (fraction of skin exposed) x min(dose / MED, 1)
 
+People differ in how much vitamin D a dose makes (age, skin, body size), so the
+most possible is also given as a range: one MED over the whole body is often
+quoted as making 10,000-25,000 IU (Holick). The time it takes to reach the
+plateau doesn't depend on that, only on the UV and the burn threshold.
+
 Expressing dose in MEDs roughly accounts for skin type, because melanin
 slows vitamin D production and burning alike. Production levels off as
 exposure continues (previtamin D reaches a photo-equilibrium), so the
@@ -22,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 IU_PER_MED_WHOLE_BODY = 16_000.0
+IU_PER_MED_RANGE: tuple[float, float] = (10_000.0, 25_000.0)  # across people, for the same dose
 PLATEAU_MED = 1.0
 DEFAULT_TARGET_IU = 1000
 # Steps for the goal's arrows. Any other value can be typed in.
@@ -79,6 +85,20 @@ def dose_for_vitamin_d(target_iu: float, med_sed: float, body_fraction: float) -
 def most_before_burning(body_fraction: float) -> float:
     """The most vitamin D (IU) a day's exposure can make before reaching the burn threshold."""
     return IU_PER_MED_WHOLE_BODY * max(body_fraction, 0.0) * PLATEAU_MED
+
+
+def iu_range(central_iu: float) -> tuple[float, float]:
+    """The spread across people around a central estimate, using IU_PER_MED_RANGE."""
+    lo, hi = IU_PER_MED_RANGE
+    return central_iu * lo / IU_PER_MED_WHOLE_BODY, central_iu * hi / IU_PER_MED_WHOLE_BODY
+
+
+def round_iu(iu: float) -> int:
+    """Round to two significant figures (6,250 -> 6,300), so ranges don't look more precise than they are."""
+    if iu <= 0:
+        return 0
+    step = 10 ** max(len(str(int(iu))) - 2, 0)
+    return int(iu / step + 0.5) * step
 
 
 def next_goal(current: float, direction: int) -> float:

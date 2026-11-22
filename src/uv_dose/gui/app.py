@@ -64,11 +64,12 @@ from uv_dose.settings import Settings
 from uv_dose.skin import SKIN_TYPES, SkinType, skin_type
 from uv_dose.vitamin_d import (
     BODY_EXPOSURES,
-    PLATEAU_MED,
     BodyExposure,
     body_exposure,
+    iu_range,
     most_before_burning,
     next_goal,
+    round_iu,
     vitamin_d_iu,
 )
 
@@ -258,6 +259,10 @@ class App:
         field("Shade", self.shade_var, [c.label for c in SHADE_CHOICES])
         field("Ground", self.surface_var, [c.label for c in SURFACE_CHOICES])
         self.spf_box = field("Sunscreen", self.spf_var, [l for l, _ in SPF_CHOICES])
+        # How thickly sunscreen goes on: one setting for all outings, kept beside the SPF it scales.
+        field("Applied", self.application_var, [c.label for c in APPLICATION_CHOICES])
+        self.sunscreen_hint = tk.StringVar()
+        hint(self.sunscreen_hint)
         outing_buttons = ttk.Frame(side)
         outing_buttons.grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.add_btn = ttk.Button(outing_buttons, text="+ Add an outing", command=self._add_outing)
@@ -287,10 +292,7 @@ class App:
         self.med_hint = tk.StringVar()
         hint(self.med_hint)
 
-        section("Sunscreen and vitamin D")
-        field("Applied", self.application_var, [c.label for c in APPLICATION_CHOICES])
-        self.sunscreen_hint = tk.StringVar()
-        hint(self.sunscreen_hint)
+        section("Vitamin D")
         field("Skin exposed", self.body_var, [b.label for b in BODY_EXPOSURES])
         ttk.Label(side, text="Vitamin D goal").grid(row=r, column=0, sticky="w", pady=3)
         tgt = ttk.Frame(side)
@@ -797,10 +799,16 @@ class App:
     def _update_hints(self) -> None:
         self._update_med_hint()
         self._sync_spf_field()
-        _set_if_changed(self.sunscreen_hint, "Most people apply half the tested amount or less."
-                        if self._sunscreen_on() else "Sunscreen is off for every outing.")
-        _set_if_changed(self.goal_hint,
-                        f"Up to about {most_before_burning(self._body().fraction):,.0f} IU before you burn.")
+        selected_spf = dict(SPF_CHOICES).get(self.spf_var.get(), self.sel.spf)
+        any_spf = selected_spf > 1 or any(o.spf > 1 for o in self.outings if o is not self.sel)
+        if not self._sunscreen_on():
+            sunscreen = "Sunscreen is off for every outing."
+        elif not any_spf:
+            sunscreen = "Pick an SPF above for the amount to count."
+        else:
+            sunscreen = "For all outings. Most people use half or less."
+        _set_if_changed(self.sunscreen_hint, sunscreen)
+        _set_if_changed(self.goal_hint, f"Most you can make: about {_iu_span(most_before_burning(self._body().fraction))}.")
 
     def _sync_spf_field(self) -> None:
         """While sunscreen is off, the Sunscreen field says so (and is locked); each outing keeps its SPF."""
@@ -849,7 +857,8 @@ class App:
         clear = None
         if source is Source.BEST and day.has_forecast and plan.minutes > plan.forecast_minutes:
             clear_series = build_series(day, Source.CLEAR_SKY)
-            clear = (clear_series, sum(window_dose(clear_series, o.start, o.end).sed for o in plan.outings))
+            clear = (clear_series, sum(window_dose(clear_series, o.start, o.end).sed * o.factor
+                                       for o in plan.outings))  # on the skin, like the headline
 
         self._fill_outing_list(plan, selected)
         self._fill_cards(series, source, plan, protection, clear, skin, med, body, target)
@@ -891,13 +900,15 @@ class App:
         rating = rate_dose(plan.skin_sed, med)
 
         # ---- dose
+        # The headline is the dose on your skin, which is what burns. ARPANSA's open-sun (ambient)
+        # dose goes underneath when shade, ground or sunscreen make the two differ.
         if abs(plan.skin_sed - plan.ambient_sed) > 0.005:
-            line1 = f"≈{plan.skin_sed:.2f} SED on your skin after {self._adjustment_words()}"
+            line1 = f"{plan.ambient_sed:.2f} SED in open sun, before {self._adjustment_words()}"
         else:
             line1 = f"{plan.ambient_sed * 100:,.0f} J/m²" + (" in total" if many else f" over {sun}")
         extra = [rating.advice]
         if clear and clear[1] > 0.05:
-            ratio = plan.ambient_sed / clear[1]
+            ratio = plan.skin_sed / clear[1]
             if ratio < 0.95:
                 extra.append(f"Cloud cut this by {1 - ratio:.0%} (clear sky: {clear[1]:.1f} SED).")
             elif ratio > 1.05:
@@ -907,7 +918,7 @@ class App:
         if plan.forecast_minutes and source is Source.BEST and plan.forecast_minutes < plan.minutes:
             extra.append(f"{plan.forecast_minutes} min from the clear-sky forecast.")
         self.cards["dose"].show(
-            f"{plan.ambient_sed:.2f}", "SED", line1,
+            f"{plan.skin_sed:.2f}", "SED", line1,
             f"{rating.label} · {rating.fraction_of_med:.0%} of your burn threshold",
             " ".join(extra), color=status_color(p, rating.level), icon=LEVEL_ICON[rating.level],
             title=f"UV dose · {dose_span}",
@@ -945,15 +956,21 @@ class App:
 
         # ---- vitamin D
         body_short = body.label.split(" (")[0].lower()
-        capped = plan.skin_sed >= med * PLATEAU_MED
-        line3 = (f"{'All outings' if many else 'Whole window'}: ≈{plan.vitd_iu:,.0f} IU"
-                 + (" (production levels off)." if capped else "."))
+        # Production levels off at the burn threshold, so the most a day can give is reached at the
+        # burn time. That time is the same for everyone with this threshold; the amount varies.
+        if plan.burn:
+            most = (f"Most possible: {_iu_span(most_before_burning(body.fraction))}, "
+                    f"at {plan.burn.at:%H:%M} when you'd start to burn.")
+        else:
+            end = series[-1].time + timedelta(minutes=1)
+            most = (f"Most possible today: {_iu_span(vitamin_d_iu(plan.dose_available, med, body.fraction))}, "
+                    f"by {end:%H:%M} if you stayed out.")
+        line3 = f"{most} {'All outings' if many else 'Whole window'}: ≈{round_iu(plan.vitd_iu):,} IU."
         title = "Vitamin D · time in the sun" if many else f"Vitamin D · from {first.start:%H:%M}"
         v = plan.vitd
         if plan.vitd_dose_sed is None:
             self.cards["vitd"].show(
                 "Not safely", "", f"{target:,} IU would take more than a burning dose on {body_short}.",
-                f"The most before burning is ≈{most_before_burning(body.fraction):,.0f} IU. "
                 "Expose more skin or lower the goal.", line3,
                 color=p.warning, icon=LEVEL_ICON["moderate"], title=title,
             )
@@ -963,17 +980,15 @@ class App:
                       else "Sweet spot, with no burn risk today.")
             self.cards["vitd"].show(
                 fmt_duration(v.sun_time), "", f"≈{target:,} IU by {v.at:%H:%M} with {body_short}{where}",
-                margin, "After that, more sun mostly adds UV damage. " + line3,
+                margin, line3,
                 color=p.good, icon=LEVEL_ICON["low"], title=title,
             )
         else:
-            possible = vitamin_d_iu(plan.dose_available, med, body.fraction)
             self.cards["vitd"].show(
                 "Not today", "",
                 f"Too little UV reaches your skin in these outings for {target:,} IU" if many
                 else f"Too little UV reaches your skin after {first.start:%H:%M} for {target:,} IU",
-                f"About {possible:,.0f} IU possible with {body_short}. "
-                + ("Try longer or earlier outings." if many else "Try an earlier start."), line3,
+                "Try longer or earlier outings." if many else "Try an earlier start.", line3,
                 color=p.warning, icon=LEVEL_ICON["moderate"], title=title,
             )
 
@@ -1176,6 +1191,12 @@ class App:
         self.root.destroy()
 
 
+def _iu_span(central_iu: float) -> str:
+    """A vitamin D amount as the range across people, e.g. "2,500–6,300 IU"."""
+    lo, hi = iu_range(central_iu)
+    return f"{round_iu(lo):,}–{round_iu(hi):,} IU"
+
+
 def _set_if_changed(var: tk.StringVar, value: str) -> None:
     """Set a label's text only when it differs: setting it repaints the label even if it's the same."""
     if var.get() != value:
@@ -1241,7 +1262,7 @@ ARPANSA measures erythemal (skin-reddening) UV once a minute at 16 sites and pub
 
 ## Standard Erythemal Dose (SED)
 1 UV Index = 25 mW/m² of erythemally weighted UV, and 1 SED = 100 J/m². So one minute at UV Index u gives 0.015 × u SED. For example, an hour at UV 10 is 9 SED. Adding up a whole day this way reproduces ARPANSA's daily totals.
-The dose is "ambient": what a flat, unshaded surface facing the sky receives. Arms, faces and backs mostly face other directions, and shade, hats and clothing cut exposure further, so the dose on your skin is usually lower.
+ARPANSA's dose is "ambient": what a flat, unshaded surface facing the sky receives. The UV dose card shows the dose on your skin: the ambient dose adjusted for each outing's shade, ground and sunscreen, with the ambient dose beneath it when they differ. With none of those set, the two are the same. Arms, faces and backs mostly face other directions, and hats and clothing cut exposure further, so the real dose on your skin is usually lower still.
 ARPANSA's guidance: "A very fair-skinned person can receive sunburn and skin damage from only two SEDs." "One SED per day is considered safe for most people. You should consider taking sun protection measures if you could be subjected to a UV dose of more than one SED, especially if you have fair skin."
 
 ## Dose rating
@@ -1263,7 +1284,7 @@ ARPANSA measures UV on a flat, open sensor. Each outing's conditions scale that 
 Shade blocks the direct sun but not UV scattered from the open sky, which is roughly half the total in summer around midday. Patchy shade counts as 0.75 and good shade as 0.5 (the cautious end; good shade can cut UV by up to 75%).
 Reflection from the ground adds UV, mostly to your face, neck and the underside of your arms. Following the WHO's typical figures, water adds 10%, beach sand 15% and fresh snow 80%. Grass, soil and paving reflect under 10% and count as zero. Shade overhead doesn't stop reflection from the sunlit ground around you, so it is added rather than reduced.
 SPF ratings assume a thick layer (2 mg/cm², about a teaspoon per limb). Most people apply half to a quarter of that. The app takes protection to drop in proportion: SPF 30 applied at half thickness acts like SPF 15.5. Some studies find it drops faster, so if you burn easily treat these as best cases. Sunscreen also wears off with sweat, swimming and towelling, so reapply every 2 hours.
-Setting "Applied" to None turns sunscreen off for every outing, which is a quick way to see what going without would mean. Each outing keeps its SPF for when you turn it back on.
+"Applied", under each outing's sunscreen, says how thickly you put it on. It is one setting for all outings and only matters for outings with an SPF. Setting it to None turns sunscreen off for every outing, which is a quick way to see what going without would mean. Each outing keeps its SPF for when you turn it back on.
 These are rough, typical figures, not measurements of your spot.
 
 ## Sun protection times
@@ -1278,7 +1299,8 @@ This uses Holick's rule of thumb, as adopted by Webb & Engelsen (2006): exposing
 Vitamin D production levels off with continued exposure, so short, regular exposure beats long sessions. The "sweet spot" is the time needed to reach your goal. Beyond it, extra sun mostly adds UV damage.
 Caveats: the model treats erythemal UV as a stand-in for vitamin-D-producing UV. That overstates production when the sun is low (early, late and in winter). It ignores age, body size and diet.
 Choosing a goal: the default of 1,000 IU is Webb & Engelsen's "standard vitamin D dose" for sun exposure. Official intake guidelines are lower: 200–600 IU a day in Australia and New Zealand, rising with age, and 600–800 IU in the US. The Endocrine Society's 2011 guideline suggested 1,500–2,000 IU for adults to keep blood levels up, but its 2024 update no longer advises more than the official amounts for healthy adults under 75. The goal's arrows step from 1,000 to 10,000 IU, and you can type any other value.
-Higher goals need more bare skin rather than more time. The most a day can make before you burn is about 16,000 IU × the fraction of skin exposed: about 4,000 IU with face, arms and hands, and about 13,600 IU in swimwear. The skin can't make too much vitamin D, because production levels off, but UV damage keeps adding up. Vitamin D also lasts for weeks in the body, so a good dose on some days covers days with less.
+The most you can make: production levels off at about one burning dose, so a day's most is reached when the dose on your skin reaches your burn threshold, at your burn time. That time depends only on the UV and your burn threshold, not on how much vitamin D your skin makes from a dose. The amount does vary from person to person: one burning dose over the whole body is often quoted as making 10,000–25,000 IU (Holick), so the app gives the most as a range. Its middle estimate, used for the goal times, is 16,000 IU × the fraction of skin exposed: about 4,000 IU with face, arms and hands (range 2,500–6,300) and about 13,600 IU in swimwear (8,500–21,000).
+Higher goals need more bare skin rather than more time. The skin can't make too much vitamin D, because production levels off, but UV damage keeps adding up. Vitamin D also lasts for weeks in the body, so a good dose on some days covers days with less.
 
 ## Measured vs clear-sky forecast
 "Measured" uses ARPANSA's readings, and for any minute without one (for example later today) it uses ARPANSA's clear-sky forecast. While today's readings are coming in, the app loads new ones every 2 minutes. Press Refresh (F5) to load them straight away; the status at the top then says how many came in. "Clear-sky forecast" shows the most UV a cloudless day would bring. That is a cautious figure for sunburn and an optimistic one for vitamin D.

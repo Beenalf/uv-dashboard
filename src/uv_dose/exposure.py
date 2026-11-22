@@ -52,9 +52,9 @@ SURFACE_CHOICES: tuple[Choice, ...] = (
 
 # Fraction of the tested 2 mg/cm² layer that is actually applied.
 APPLICATION_CHOICES: tuple[Choice, ...] = (
-    Choice("tested", "Thick, as tested (about 1 tsp per limb)", 1.0, "thick"),
-    Choice("typical", "Typical (about half that)", 0.5, "typical"),
-    Choice("thin", "Thin (about a quarter)", 0.25, "thin"),
+    Choice("tested", "Thick, as tested", 1.0, "thick"),  # 2 mg/cm², about a teaspoon per limb
+    Choice("typical", "Typical (half as thick)", 0.5, "typical"),
+    Choice("thin", "Thin (a quarter)", 0.25, "thin"),
     Choice("none", "None (no sunscreen)", 0.0, "none"),  # turns off every outing's SPF
 )
 

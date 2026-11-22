@@ -8,7 +8,14 @@ from conftest import constant_day
 from uv_dose.dose import build_series
 from uv_dose.planner import Outing, plan_day
 from uv_dose.skin import MAX_SCORE, QUESTIONS, SKIN_TYPES, score_answers, skin_type_from_score
-from uv_dose.vitamin_d import dose_for_vitamin_d, most_before_burning, next_goal, vitamin_d_iu
+from uv_dose.vitamin_d import (
+    dose_for_vitamin_d,
+    iu_range,
+    most_before_burning,
+    next_goal,
+    round_iu,
+    vitamin_d_iu,
+)
 
 # ---------------------------------------------------------------- Fitzpatrick
 
@@ -113,3 +120,13 @@ def test_goal_steps_from_1000_to_10000():
     assert next_goal(10000, +1) == 10000  # stays at the ends
     assert next_goal(1000, -1) == 1000
     assert next_goal(600, -1) == 600 and next_goal(600, +1) == 1000
+
+
+def test_most_possible_is_a_range_across_people():
+    # 25% of skin: 4,000 IU in the middle, 2,500-6,250 across the quoted 10,000-25,000 IU per whole-body MED
+    assert iu_range(most_before_burning(0.25)) == pytest.approx((2500, 6250))
+    assert iu_range(most_before_burning(0.85)) == pytest.approx((8500, 21250))
+
+
+def test_round_iu_to_two_significant_figures():
+    assert [round_iu(x) for x in (6250, 21250, 2500, 8500, 625, 13600, 0)] == [6300, 21000, 2500, 8500, 630, 14000, 0]
