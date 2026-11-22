@@ -282,6 +282,7 @@ class ArpansaClient:
         self.timeout = timeout
         self._cache: dict[tuple[str, date], tuple[float, DayData]] = {}
         self._lock = threading.Lock()
+        self._fetching: dict[tuple[str, date], threading.Lock] = {}  # one download per site and day at a time
 
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = self.base_url + path
@@ -310,18 +311,33 @@ class ArpansaClient:
 
     def day(self, site: Site, day: date, *, force: bool = False) -> DayData:
         key = (site.code, day)
-        now = time.monotonic()
         with self._lock:
-            cached = self._cache.get(key)
-        if cached and not force:
-            fetched, data = cached
-            if data.is_complete or now - fetched < LIVE_CACHE_SECONDS:
-                return data
-        payload = self._get_json(
-            "api/uvlevel/",
-            {"longitude": site.longitude, "latitude": site.latitude, "date": day.isoformat()},
-        )
-        data = parse_day(payload, site, day)
-        with self._lock:
-            self._cache[key] = (now, data)
-        return data
+            fetching = self._fetching.setdefault(key, threading.Lock())
+        # A caller that arrives while the same day is downloading (e.g. the window asking for
+        # the day that ``prefetch`` started on) waits for that download and uses it.
+        with fetching:
+            now = time.monotonic()
+            with self._lock:
+                cached = self._cache.get(key)
+            if cached and not force:
+                fetched, data = cached
+                if data.is_complete or now - fetched < LIVE_CACHE_SECONDS:
+                    return data
+            payload = self._get_json(
+                "api/uvlevel/",
+                {"longitude": site.longitude, "latitude": site.latitude, "date": day.isoformat()},
+            )
+            data = parse_day(payload, site, day)
+            with self._lock:
+                self._cache[key] = (now, data)
+            return data
+
+    def prefetch(self, site: Site, day: date) -> None:
+        """Start downloading a day in the background, so a later ``day()`` call finds it ready."""
+        def fetch() -> None:
+            try:
+                self.day(site, day)
+            except ArpansaError:
+                pass  # the window's own request reports the problem
+
+        threading.Thread(target=fetch, daemon=True).start()

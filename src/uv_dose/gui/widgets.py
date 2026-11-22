@@ -192,10 +192,12 @@ class ResultCard(tk.Frame):
 
     def _rewrap(self, event: tk.Event | None = None) -> None:
         width = max((event.width if event else self.winfo_width()) - 36, 120)
-        self.title.configure(wraplength=width)
-        self.line1.configure(wraplength=width)
-        self.line3.configure(wraplength=width)
-        self.line2.configure(wraplength=max(width - self.icon.winfo_reqwidth(), 100))
+        # Reconfiguring a label re-lays out the window even when the value is the same, and this
+        # runs on every resize of the card (including height changes), so skip unchanged values.
+        for label, wrap in ((self.title, width), (self.line1, width), (self.line3, width),
+                            (self.line2, max(width - self.icon.winfo_reqwidth(), 100))):
+            if int(str(label.cget("wraplength")) or 0) != wrap:
+                label.configure(wraplength=wrap)
 
     def apply_palette(self, p: Palette) -> None:
         self._palette = p
@@ -270,10 +272,15 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.configure(yscrollcommand=self.vbar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.vbar.grid(row=0, column=1, sticky="ns", padx=(4, 0) if fit_width else 0)
+        if autohide:
+            self.vbar.grid_remove()  # until the contents are known not to fit; usually they do
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         self.inner = ttk.Frame(self.canvas)
         self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        # Last values applied. Reconfiguring the canvas or re-gridding the scrollbar re-lays out
+        # the window even when nothing changes, so each is only done when its value changes.
+        self._applied: dict[str, object] = {}
         self.inner.bind("<Configure>", self._on_inner)
         self.canvas.bind("<Configure>", self._on_canvas)
         # Only capture the mouse wheel while the pointer is over this frame.
@@ -283,23 +290,39 @@ class ScrollableFrame(ttk.Frame):
     def set_background(self, color: str) -> None:
         self.canvas.configure(background=color)
 
-    def _on_inner(self, event: tk.Event) -> None:
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        if self._fit_width:
+    def _changed(self, key: str, value: object) -> bool:
+        if self._applied.get(key) == value:
+            return False
+        self._applied[key] = value
+        return True
+
+    def refit(self) -> None:
+        """Apply the contents' current size now (normally done when they report a resize)."""
+        self._on_inner()
+
+    def _on_inner(self, event: tk.Event | None = None) -> None:
+        region = self.canvas.bbox("all")
+        if self._changed("region", region):
+            self.canvas.configure(scrollregion=region)
+        if self._fit_width and self._changed("width", self.inner.winfo_reqwidth()):
             self.canvas.configure(width=self.inner.winfo_reqwidth())
         self._update_bar()
 
     def _on_canvas(self, event: tk.Event) -> None:
-        self.canvas.itemconfigure(self._win, width=event.width)
+        if self._changed("inner_width", event.width):
+            self.canvas.itemconfigure(self._win, width=event.width)
         self._update_bar()
 
     def _fits(self) -> bool:
         return self.inner.winfo_reqheight() <= self.canvas.winfo_height()
 
     def _update_bar(self) -> None:
-        if not self._autohide:
+        if not self._autohide or self.canvas.winfo_height() < 2:  # not laid out yet
             return
-        if self._fits():
+        fits = self._fits()
+        if not self._changed("fits", fits):
+            return
+        if fits:
             self.vbar.grid_remove()
             self.canvas.yview_moveto(0)
         else:

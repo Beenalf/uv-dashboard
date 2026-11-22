@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, timedelta
 
 import pytest
 
-from conftest import MELBOURNE
+from conftest import MELBOURNE, load_json
 from uv_dose.arpansa import ArpansaClient, ArpansaError, parse_day, parse_sites
 
 
@@ -71,6 +73,32 @@ def test_parse_day_rejects_garbage():
 def test_complete_day_flags(mel_day):
     assert mel_day.has_data and mel_day.has_measurements and mel_day.is_complete
     assert len(mel_day.samples) == 840  # 06:00-19:59, one per minute
+
+
+def test_prefetch_and_window_share_one_download():
+    """The window's request for the day being prefetched waits for that download instead of repeating it."""
+    calls = []
+
+    class SlowClient(ArpansaClient):
+        def _get_json(self, path, params=None):
+            calls.append(params["date"])
+            time.sleep(0.3)
+            return load_json("uvlevel_mel_2026-11-20.json")
+
+    client = SlowClient()
+    day = date(2026, 11, 20)
+    client.prefetch(MELBOURNE, day)
+    time.sleep(0.05)  # the prefetch is now downloading
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(client.day(MELBOURNE, day))) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert calls == ["2026-11-20"]
+    assert len(results) == 2 and all(r.is_complete for r in results)
+    client.day(MELBOURNE, day, force=True)  # Refresh still downloads again
+    assert len(calls) == 2
 
 
 @pytest.mark.network

@@ -8,7 +8,12 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "matplotlib>=3.11.2",
+    # Held below 3.11: matplotlib 3.11.2 lays out text about 5x slower (about 7 ms per label
+    # against 1.5 ms on 3.10), which made every chart redraw take a third of a second.
+    "matplotlib>=3.10.9,<3.11",
+    # matplotlib 3.10 converts dates with a NumPy feature deprecated in NumPy 2.5 (it warns
+    # now and is due to become an error), so NumPy is held with it. Lift both together.
+    "numpy<2.6",
     "sv-ttk>=2.6.1",
 ]
 

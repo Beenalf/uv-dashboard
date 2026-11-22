@@ -75,6 +75,7 @@ from uv_dose.vitamin_d import (
 SPF_CHOICES: tuple[tuple[str, int], ...] = (("No sunscreen", 1), ("SPF 15", 15), ("SPF 30", 30), ("SPF 50+", 50))
 SPF_OFF_LABEL = "Off (Applied is None)"  # shown instead of the outing's SPF while sunscreen is turned off
 AUTO_REFRESH_MS = 120_000
+RECOMPUTE_DELAY_MS = 50  # lets a burst of changes (e.g. a held spinbox arrow) update the results once
 CARDS_ONE_ROW_MIN_WIDTH = 880  # px; below this the result cards wrap into a 2 x 2 grid
 APP_TITLE = "UV Dose"
 
@@ -320,24 +321,39 @@ class App:
         main = ttk.Frame(outer)
         main.grid(row=1, column=1, sticky="nsew")
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(1, weight=1)
 
-        cards = ttk.Frame(main)
+        # The results (cards and note) sit in a block whose height may grow but doesn't shrink
+        # back while the width stays the same. Otherwise every change that adds or removes a line
+        # of text would resize the chart below, which redraws it a second time.
+        results = ttk.Frame(main)
+        results.grid(row=0, column=0, sticky="new")
+        results.columnconfigure(0, weight=1)
+        _keep_row_height(results, main, 0)
+        cards = ttk.Frame(results)
         cards.grid(row=0, column=0, sticky="ew")
         self._cards_frame = cards
         self.cards: dict[str, ResultCard] = {}
         for key, title in (("dose", "UV dose"), ("burn", "Time to burn"), ("vitd", "Vitamin D"), ("uv", "Peak UV")):
             self.cards[key] = ResultCard(cards, title, self.palette)
         self._layout_cards(4)
-        cards.bind("<Configure>", lambda e: self._layout_cards(4 if e.width >= CARDS_ONE_ROW_MIN_WIDTH else 2))
+        cards.bind("<Configure>", lambda e: e.width > 1 and self._layout_cards(  # 1: not laid out yet
+            4 if e.width >= CARDS_ONE_ROW_MIN_WIDTH else 2))
 
         self.note_var = tk.StringVar()
-        note = ttk.Label(main, textvariable=self.note_var, style="Muted.TLabel", font=f["caption"], justify="left")
+        note = ttk.Label(results, textvariable=self.note_var, style="Muted.TLabel", font=f["caption"],
+                         justify="left")
         note.grid(row=1, column=0, sticky="ew", pady=(6, 4))
-        main.bind("<Configure>", lambda e: note.configure(wraplength=max(e.width - 8, 200)), add="+")
+
+        def wrap_note(event: tk.Event) -> None:
+            width = max(event.width - 8, 200)
+            if int(str(note.cget("wraplength")) or 0) != width:  # reconfiguring re-lays out the window
+                note.configure(wraplength=width)
+
+        main.bind("<Configure>", wrap_note, add="+")
 
         self.tabs = ttk.Notebook(main)
-        self.tabs.grid(row=2, column=0, sticky="nsew")
+        self.tabs.grid(row=1, column=0, sticky="nsew")
         chart_tab = ttk.Frame(self.tabs)
         self.tabs.add(chart_tab, text="Chart")
         self.chart = DoseChart(chart_tab, self.palette, on_select=self._on_chart_select,
@@ -382,6 +398,10 @@ class App:
                   style="Muted.TLabel", font=f["caption"]).pack(side="right")
         self._update_hints()
         self._refresh_outing_controls()
+        # Lay the window out now, so the sidebar's width is settled before the first chart is
+        # drawn. Otherwise the chart is drawn, then narrowed by the sidebar, then drawn again.
+        self.root.update_idletasks()
+        self.side_scroller.refit()
 
     def _layout_cards(self, cols: int) -> None:
         """One row of four cards, or a 2 x 2 grid when the window is too narrow for four."""
@@ -742,13 +762,15 @@ class App:
 
     def _refresh_outing_controls(self) -> None:
         many = len(self.outings) > 1
-        if many:
+        if many and not self.outing_list.winfo_manager():
             self.outing_list.grid()
             self.remove_btn.pack(side="left")
-        else:
+        elif not many and self.outing_list.winfo_manager():
             self.outing_list.grid_remove()
             self.remove_btn.pack_forget()
-        self.add_btn.state(["disabled"] if len(self.outings) >= MAX_OUTINGS else ["!disabled"])
+        full = len(self.outings) >= MAX_OUTINGS
+        if self.add_btn.instate(["disabled"]) != full:
+            self.add_btn.state(["disabled"] if full else ["!disabled"])
 
     def _on_chart_click_select(self, t: datetime) -> bool:
         """A click inside another outing selects it. Returns True if it did."""
@@ -775,9 +797,10 @@ class App:
     def _update_hints(self) -> None:
         self._update_med_hint()
         self._sync_spf_field()
-        self.sunscreen_hint.set("Most people apply half the tested amount or less." if self._sunscreen_on()
-                                else "Sunscreen is off for every outing.")
-        self.goal_hint.set(f"Up to about {most_before_burning(self._body().fraction):,.0f} IU before you burn.")
+        _set_if_changed(self.sunscreen_hint, "Most people apply half the tested amount or less."
+                        if self._sunscreen_on() else "Sunscreen is off for every outing.")
+        _set_if_changed(self.goal_hint,
+                        f"Up to about {most_before_burning(self._body().fraction):,.0f} IU before you burn.")
 
     def _sync_spf_field(self) -> None:
         """While sunscreen is off, the Sunscreen field says so (and is locked); each outing keeps its SPF."""
@@ -785,12 +808,14 @@ class App:
         if self._sunscreen_on():
             if self.spf_var.get() not in spf_labels:
                 self.spf_var.set(next((label for label, v in SPF_CHOICES if v == self.sel.spf), SPF_CHOICES[0][0]))
-            self.spf_box.state(["!disabled"])
+            if self.spf_box.instate(["disabled"]):
+                self.spf_box.state(["!disabled"])
         else:
             if self.spf_var.get() != SPF_OFF_LABEL:
                 self.sel.spf = spf_labels.get(self.spf_var.get(), self.sel.spf)
                 self.spf_var.set(SPF_OFF_LABEL)
-            self.spf_box.state(["disabled"])
+            if not self.spf_box.instate(["disabled"]):
+                self.spf_box.state(["disabled"])
 
     def _update_med_hint(self) -> None:
         st = self._skin()
@@ -799,12 +824,12 @@ class App:
         text = f"Type {st.roman} default: {st.med_sed:g} SED (published range {st.med_range})."
         if custom:
             text = "Custom threshold. " + text
-        self.med_hint.set(text)
+        _set_if_changed(self.med_hint, text)
 
     # ================================================================== calculations -> UI
 
     def _schedule_recompute(self) -> None:
-        self._later("recompute", 120, self._recompute)
+        self._later("recompute", RECOMPUTE_DELAY_MS, self._recompute)
 
     def _recompute(self) -> None:
         self._update_hints()
@@ -1151,6 +1176,31 @@ class App:
         self.root.destroy()
 
 
+def _set_if_changed(var: tk.StringVar, value: str) -> None:
+    """Set a label's text only when it differs: setting it repaints the label even if it's the same."""
+    if var.get() != value:
+        var.set(value)
+
+
+def _keep_row_height(content: tk.Widget, parent: tk.Misc, row: int) -> None:
+    """Let ``parent``'s grid ``row`` grow with ``content`` but not shrink, until the width changes.
+
+    ``content`` must be gridded with ``sticky`` excluding "s", so its own height
+    stays its natural height and shows up in its <Configure> events.
+    """
+    seen = {"width": -1, "height": 0}
+
+    def on_configure(event: tk.Event) -> None:
+        if event.width != seen["width"]:  # new width: text rewraps, so start again from scratch
+            seen["width"], seen["height"] = event.width, 0
+            parent.rowconfigure(row, minsize=0)
+        elif event.height > seen["height"]:
+            seen["height"] = event.height
+            parent.rowconfigure(row, minsize=event.height)
+
+    content.bind("<Configure>", on_configure, add="+")
+
+
 def _refresh_summary(before: DayData, after: DayData) -> str:
     """Status after a Refresh: how many new readings came in, or that there were none."""
     prev = before.latest_measured
@@ -1238,7 +1288,7 @@ Sunburn can take 16–24 hours to show fully.
 """
 
 
-def run() -> None:
+def run(client: ArpansaClient | None = None, settings: Settings | None = None) -> None:
     if sys.platform == "win32":
         try:
             import ctypes
@@ -1247,5 +1297,5 @@ def run() -> None:
         except Exception:
             pass
     root = tk.Tk()
-    App(root, ArpansaClient(), Settings.load())
+    App(root, client or ArpansaClient(), settings or Settings.load())
     root.mainloop()
