@@ -6,7 +6,7 @@ import textwrap
 import tkinter as tk
 from tkinter import ttk
 
-from uv_dose.gui.theme import Palette, fonts
+from uv_dose.gui.theme import Palette, fonts, style_title_bar
 from uv_dose.gui.widgets import ScrollableFrame
 from uv_dose.skin import MAX_SCORE, QUESTIONS, SECTIONS, SkinType, score_answers, skin_type_from_score
 
@@ -21,6 +21,7 @@ class FitzpatrickDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Find your skin type (Fitzpatrick scale)")
         self.configure(background=palette.window)
+        style_title_bar(self, palette)
         self.transient(master)
         self.resizable(True, True)
         self.result: tuple[SkinType, dict[str, int]] | None = None

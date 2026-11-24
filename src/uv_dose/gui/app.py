@@ -49,12 +49,23 @@ from uv_dose.exposure import (
 from uv_dose.gui.chart import ChartView, DoseChart
 from uv_dose.gui.outings import MAX_OUTINGS, OutingList, OutingSpec
 from uv_dose.gui.quiz import FitzpatrickDialog
-from uv_dose.gui.theme import LEVEL_ICON, Palette, apply_ttk_theme, fonts, status_color
+from uv_dose.gui.theme import (
+    LEVEL_ICON,
+    Palette,
+    apply_ttk_theme,
+    fonts,
+    status_color,
+    style_menu,
+    style_title_bar,
+    sun_logo,
+)
 from uv_dose.gui.widgets import (
     DateControl,
     ResultCard,
     ScrollableFrame,
     TimeSpinbox,
+    UVRibbon,
+    autohide_scrollbar,
     fmt_clock,
     fmt_duration,
     parse_time,
@@ -134,7 +145,6 @@ class App:
         self._initial_geometry()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._build_menu()
         self._build_layout()
         self._apply_palette()
 
@@ -162,28 +172,32 @@ class App:
             except tk.TclError:
                 root.geometry(f"{sw - 40}x{sh - 100}+0+0")
 
-    def _build_menu(self) -> None:
-        bar = tk.Menu(self.root)
-        file_menu = tk.Menu(bar, tearoff=False)
-        file_menu.add_command(label="Copy hourly table as CSV", command=self._copy_csv)
-        file_menu.add_command(label="Refresh data", accelerator="F5", command=lambda: self._load_day(force=True))
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self._on_close)
-        bar.add_cascade(label="File", menu=file_menu)
-        view_menu = tk.Menu(bar, tearoff=False)
-        view_menu.add_checkbutton(label="Dark theme", variable=self.dark_var, command=self._toggle_theme)
-        bar.add_cascade(label="View", menu=view_menu)
-        help_menu = tk.Menu(bar, tearoff=False)
-        help_menu.add_command(label="How the calculations work", command=self._show_help)
-        help_menu.add_command(label="ARPANSA data disclaimer", command=self._show_disclaimer)
-        help_menu.add_separator()
-        help_menu.add_command(label="Open ARPANSA's UV dose page", command=lambda: webbrowser.open(DOSE_PAGE_URL))
-        bar.add_cascade(label="Help", menu=help_menu)
-        self.root.configure(menu=bar)
+    def _build_menu(self, parent: tk.Misc) -> ttk.Menubutton:
+        """The app's menu, behind a button at the right of the header.
+
+        It replaces a menu bar, which Windows always draws in its own light colours.
+        """
+        button = ttk.Menubutton(parent, text="☰")
+        menu = tk.Menu(button, tearoff=False)
+        menu.add_command(label="Refresh data", accelerator="F5", command=lambda: self._load_day(force=True))
+        menu.add_command(label="Copy hourly table as CSV", command=self._copy_csv)
+        menu.add_separator()
+        menu.add_checkbutton(label="Dark theme", variable=self.dark_var, command=self._toggle_theme)
+        menu.add_separator()
+        menu.add_command(label="How the calculations work", command=self._show_help)
+        menu.add_command(label="ARPANSA data disclaimer", command=self._show_disclaimer)
+        menu.add_command(label="Open ARPANSA's UV dose page", command=lambda: webbrowser.open(DOSE_PAGE_URL))
+        menu.add_separator()
+        menu.add_command(label="Exit", command=self._on_close)
+        button.configure(menu=menu)
+        style_menu(menu, self.palette)
+        self.menu = menu
         self.root.bind("<F5>", lambda e: self._load_day(force=True))
+        return button
 
     def _build_layout(self) -> None:
         f = fonts(self.root)
+        UVRibbon(self.root).pack(side="top", fill="x")
         outer = ttk.Frame(self.root, padding=(16, 12, 16, 8))
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(1, weight=1)
@@ -193,7 +207,8 @@ class App:
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         header.columnconfigure(5, weight=1)
-        ttk.Label(header, text="☀ " + APP_TITLE, style="Header.TLabel").grid(row=0, column=0, padx=(0, 24))
+        ttk.Label(header, text=" " + APP_TITLE, image=sun_logo(self.root, 26), compound="left",
+                  style="Header.TLabel").grid(row=0, column=0, padx=(0, 24))
         ttk.Label(header, text="City").grid(row=0, column=1, padx=(0, 6))
         self.site_box = ttk.Combobox(header, textvariable=self.site_var, state="readonly", width=22,
                                      values=[s.label for s in self.sites])
@@ -205,6 +220,7 @@ class App:
         ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel", anchor="e", justify="right",
                   wraplength=260).grid(row=0, column=5, sticky="e", padx=(12, 8))
         ttk.Button(header, text="↻ Refresh", command=lambda: self._load_day(force=True)).grid(row=0, column=6)
+        self._build_menu(header).grid(row=0, column=7, padx=(6, 0))
 
         # ---------------- sidebar
         # The sidebar scrolls when it's taller than the window (e.g. several outings on a small screen).
@@ -356,23 +372,23 @@ class App:
 
         self.tabs = ttk.Notebook(main)
         self.tabs.grid(row=1, column=0, sticky="nsew")
-        chart_tab = ttk.Frame(self.tabs)
+        chart_tab = ttk.Frame(self.tabs, style="Surface.TFrame")
         self.tabs.add(chart_tab, text="Chart")
         self.chart = DoseChart(chart_tab, self.palette, on_select=self._on_chart_select,
                                on_click=self._on_chart_click)
         self.chart.widget.pack(fill="both", expand=True)
 
-        table_tab = ttk.Frame(self.tabs, padding=8)
+        table_tab = ttk.Frame(self.tabs, padding=8, style="Surface.TFrame")
         self.tabs.add(table_tab, text="Hourly table")
         table_tab.columnconfigure(0, weight=1)
         table_tab.rowconfigure(1, weight=1)
-        bar = ttk.Frame(table_tab)
+        bar = ttk.Frame(table_tab, style="Surface.TFrame")
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         self.table_caption = tk.StringVar()
-        ttk.Label(bar, textvariable=self.table_caption, style="Muted.TLabel").pack(side="left")
-        ttk.Button(bar, text="Copy as CSV", command=self._copy_csv).pack(side="right")
+        ttk.Label(bar, textvariable=self.table_caption, style="Muted.Surface.TLabel").pack(side="left")
+        ttk.Button(bar, text="Copy as CSV", style="Surface.TButton", command=self._copy_csv).pack(side="right")
         cols = ("time", "mean", "peak", "sed", "cum", "skin", "data")
-        self.table = ttk.Treeview(table_tab, columns=cols, show="headings", height=12)
+        self.table = ttk.Treeview(table_tab, columns=cols, show="headings", height=12, style="Surface.Treeview")
         for col, text, w, anchor in (
             ("time", "Time", 120, "w"), ("mean", "Mean UV", 80, "e"), ("peak", "Peak UV", 80, "e"),
             ("sed", "Dose (SED)", 90, "e"), ("cum", "Running total (SED)", 140, "e"),
@@ -381,9 +397,10 @@ class App:
             self.table.heading(col, text=text, anchor=anchor)
             self.table.column(col, width=w, anchor=anchor, stretch=col == "data")
         self.table.grid(row=1, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(table_tab, orient="vertical", command=self.table.yview)
+        sb = ttk.Scrollbar(table_tab, orient="vertical", command=self.table.yview,
+                           style="Surface.Vertical.TScrollbar")
         sb.grid(row=1, column=1, sticky="ns")
-        self.table.configure(yscrollcommand=sb.set)
+        self.table.configure(yscrollcommand=autohide_scrollbar(sb))
 
         # ---------------- footer (ARPANSA's conditions of use: attribution + disclaimer link)
         footer = ttk.Frame(outer)
@@ -392,7 +409,7 @@ class App:
                   font=f["caption"]).pack(side="left")
         self._links: list[ttk.Label] = []
         for text, cmd in (("Data disclaimer", self._show_disclaimer), ("How the calculations work", self._show_help)):
-            link = ttk.Label(footer, text=text, cursor="hand2", font=f["caption"], foreground=self.palette.series)
+            link = ttk.Label(footer, text=text, cursor="hand2", font=f["caption"], foreground=self.palette.link)
             link.pack(side="left", padx=(12, 0))
             link.bind("<Button-1>", lambda e, c=cmd: c())
             self._links.append(link)
@@ -424,7 +441,8 @@ class App:
         for card in self.cards.values():
             card.apply_palette(self.palette)
         for link in self._links:
-            link.configure(foreground=self.palette.series)
+            link.configure(foreground=self.palette.link)
+        style_menu(self.menu, self.palette)
         self.chart.set_palette(self.palette)
 
     def _toggle_theme(self) -> None:
@@ -1134,6 +1152,7 @@ class App:
         dlg.title(title)
         dlg.transient(self.root)
         dlg.configure(background=p.window)
+        style_title_bar(dlg, p)
         frame = ttk.Frame(dlg, padding=16)
         frame.pack(fill="both", expand=True)
         frame.rowconfigure(0, weight=1)

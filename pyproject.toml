@@ -14,7 +14,8 @@ dependencies = [
     # matplotlib 3.10 converts dates with a NumPy feature deprecated in NumPy 2.5 (it warns
     # now and is due to become an error), so NumPy is held with it. Lift both together.
     "numpy<2.6",
-    "sv-ttk>=2.6.1",
+    # Draws the window's rounded widgets (uv_dose/gui/theme.py); matplotlib needs it too.
+    "pillow>=10",
 ]
 
 [project.scripts]

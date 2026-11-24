@@ -46,10 +46,12 @@ Needs Python 3.13+ (with Tk, which the python.org and uv builds include).
   before extra sun mostly adds damage, and the app says when a goal needs more bare
   skin than you have chosen. It also gives the most you could make that day, as a
   range because people differ, and the time you'd reach it (your burn time).
-- **Hourly table**, which you can copy as CSV. There is also a dark theme, and your
-  settings are remembered (in `%APPDATA%\uv-dose\settings.json` on Windows).
+- **Hourly table**, which you can copy as CSV. The window has its own light and dark
+  looks (dark is in the ☰ menu), and your settings are remembered (in
+  `%APPDATA%\uv-dose\settings.json` on Windows).
 
-The calculation details and their limits are under **Help → How the calculations work**.
+The calculation details and their limits are under **☰ → How the calculations work**,
+also linked at the bottom of the window.
 
 ## Data source
 
@@ -63,7 +65,7 @@ app interpolates it.
 ARPANSA's conditions of use for this data include:
 
 - acknowledging ARPANSA as the source (the app footer does this);
-- linking to their disclaimer (Help → ARPANSA data disclaimer);
+- linking to their disclaimer (☰ → ARPANSA data disclaimer, also linked in the footer);
 - not linking the data to commercial promotion without permission;
 - **notifying ARPANSA that the data is used in an application.** That step is up to you.
 
@@ -75,7 +77,9 @@ uv run pytest -m "not network" # offline only
 ```
 
 The core maths (`arpansa.py`, `dose.py`, `exposure.py`, `skin.py`, `vitamin_d.py`,
-`planner.py`) has no GUI dependency. The tests check it against ARPANSA's published dose figures
+`planner.py`) has no GUI dependency. The window's look is a ttk theme of its own
+(`gui/theme.py`): rounded shapes drawn with Pillow at startup, kept opaque and large
+enough that Tk repaints them quickly. The tests check it against ARPANSA's published dose figures
 for a real day (Melbourne, 20 Nov 2026).
 
 Not medical advice. The burn and vitamin D figures come from simple published

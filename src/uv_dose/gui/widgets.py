@@ -1,4 +1,4 @@
-"""Small reusable widgets: time and date inputs, result cards, a scrollable frame."""
+"""Small reusable widgets: time and date inputs, result cards, a scrollable frame, the UV ribbon."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from datetime import date, datetime, time, timedelta
 from tkinter import ttk
 from typing import Callable
 
-from uv_dose.gui.theme import Palette, fonts
+from PIL import ImageTk
+
+from uv_dose.dose import UV_CATEGORIES
+from uv_dose.gui.theme import Palette, card_insets, card_style, fonts, uv_gradient
 
 # ------------------------------------------------------------------ parsing helpers
 
@@ -153,16 +156,20 @@ class DateControl(ttk.Frame):
 # ------------------------------------------------------------------ result card
 
 
-class ResultCard(tk.Frame):
-    """A tile with a coloured stripe, a title, a big value and up to three detail lines."""
+class ResultCard(ttk.Frame):
+    """A rounded tile with a coloured stripe, a title, a big value and up to three detail lines.
+
+    The card itself (outline, shadow, stripe) is a theme image; see theme.card_style.
+    """
 
     def __init__(self, master: tk.Misc, title: str, palette: Palette) -> None:
-        super().__init__(master, highlightthickness=1, bd=0)
+        self._style = card_style(None)
+        super().__init__(master, style=self._style)
         f = fonts(self)
-        self.stripe = tk.Frame(self, width=5)
-        self.stripe.pack(side="left", fill="y")
-        body = tk.Frame(self, padx=12, pady=8)
-        body.pack(side="left", fill="both", expand=True)
+        left, top, right, bottom = card_insets()
+        self._inset = left + right
+        body = tk.Frame(self, bd=0, highlightthickness=0)
+        body.pack(fill="both", expand=True, padx=(left, right), pady=(top, bottom))
         self._body = body
         self.title = tk.Label(body, text=title, font=f["caption"], anchor="w")
         self.title.pack(fill="x")
@@ -185,13 +192,13 @@ class ResultCard(tk.Frame):
         self.line3 = tk.Label(body, font=f["caption"], anchor="w", justify="left")
         self.line3.pack(fill="x")
         self._compact = False  # hides the secondary detail line, to leave room for the chart
-        self._stripe_color = palette.border
+        self._stripe_color: str | None = None
         self._icon_color = palette.ink
         self.apply_palette(palette)
         self.bind("<Configure>", self._rewrap)
 
     def _rewrap(self, event: tk.Event | None = None) -> None:
-        width = max((event.width if event else self.winfo_width()) - 36, 120)
+        width = max((event.width if event else self.winfo_width()) - self._inset - 4, 120)
         # Reconfiguring a label re-lays out the window even when the value is the same, and this
         # runs on every resize of the card (including height changes), so skip unchanged values.
         for label, wrap in ((self.title, width), (self.line1, width), (self.line3, width),
@@ -202,7 +209,10 @@ class ResultCard(tk.Frame):
     def apply_palette(self, p: Palette) -> None:
         self._palette = p
         bg = p.surface
-        self.configure(background=bg, highlightbackground=p.border, highlightcolor=p.border)
+        style = card_style(self._stripe_color)
+        if style != self._style:
+            self._style = style
+            self.configure(style=style)
         for w in (self._body, self._row, self._badge):
             w.configure(background=bg)
         self.title.configure(background=bg, foreground=p.ink2)
@@ -212,7 +222,6 @@ class ResultCard(tk.Frame):
         self.line2.configure(background=bg, foreground=p.ink)
         self.line3.configure(background=bg, foreground=p.ink2)
         self.icon.configure(background=bg, foreground=self._icon_color)
-        self.stripe.configure(background=self._stripe_color)
 
     def show(
         self,
@@ -234,7 +243,7 @@ class ResultCard(tk.Frame):
         self.line2.configure(text=line2)
         self.line3.configure(text=line3)
         self._pack_line3()
-        self._stripe_color = color or self._palette.border
+        self._stripe_color = color
         self._icon_color = color or self._palette.ink
         self.icon.configure(text=(icon + " ") if icon else "")
         self.apply_palette(self._palette)
@@ -250,6 +259,46 @@ class ResultCard(tk.Frame):
             self.line3.pack_forget()
         else:
             self.line3.pack(fill="x")
+
+
+# ------------------------------------------------------------------ scrollbar
+
+
+def autohide_scrollbar(bar: ttk.Scrollbar) -> Callable[[str, str], None]:
+    """A yscrollcommand for a gridded scrollbar that hides it while everything fits."""
+    shown = [True]
+
+    def set_(first: str, last: str) -> None:
+        needed = float(first) > 0 or float(last) < 1
+        if needed != shown[0]:  # re-gridding re-lays out the window, so only on a change
+            shown[0] = needed
+            bar.grid() if needed else bar.grid_remove()
+        bar.set(first, last)
+
+    return set_
+
+
+# ------------------------------------------------------------------ UV ribbon
+
+
+class UVRibbon(tk.Canvas):
+    """A thin band across the top of the window, blending through the UV Index colours."""
+
+    def __init__(self, master: tk.Misc, height: int = 4) -> None:
+        scale = max(master.winfo_fpixels("1i") / 96, 1.0)
+        super().__init__(master, height=max(2, round(height * scale)), highlightthickness=0, borderwidth=0)
+        self._photo: ImageTk.PhotoImage | None = None
+        self._width = 0
+        self._item = self.create_image(0, 0, anchor="nw")
+        self.bind("<Configure>", self._redraw)
+
+    def _redraw(self, event: tk.Event) -> None:
+        if event.width == self._width or event.width < 2:
+            return
+        self._width = event.width
+        im = uv_gradient(event.width, event.height, [c.color for c in UV_CATEGORIES])
+        self._photo = ImageTk.PhotoImage(im, master=self)
+        self.itemconfigure(self._item, image=self._photo)
 
 
 # ------------------------------------------------------------------ scrollable frame
