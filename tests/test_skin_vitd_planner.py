@@ -9,6 +9,7 @@ from uv_dose.dose import build_series
 from uv_dose.planner import Outing, plan_day
 from uv_dose.skin import MAX_SCORE, QUESTIONS, SKIN_TYPES, score_answers, skin_type_from_score
 from uv_dose.vitamin_d import (
+    body_exposure,
     dose_for_vitamin_d,
     iu_range,
     most_before_burning,
@@ -107,6 +108,7 @@ def test_plan_on_real_partial_day_flags_forecast(mel_partial_day):
 def test_most_before_burning_limits_high_goals():
     assert most_before_burning(0.25) == pytest.approx(4000)
     assert most_before_burning(0.85) == pytest.approx(13600)
+    assert most_before_burning(body_exposure("nude").fraction) == pytest.approx(16000)  # the whole body
     # 10,000 IU is out of reach with face, arms and hands, but not in swimwear
     assert dose_for_vitamin_d(10_000, 2.5, 0.25) is None
     assert dose_for_vitamin_d(10_000, 2.5, 0.85) == pytest.approx(10_000 / 13_600 * 2.5)

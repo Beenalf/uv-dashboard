@@ -47,6 +47,7 @@ BODY_EXPOSURES: tuple[BodyExposure, ...] = (
     BodyExposure("face_arms", "Face, arms and hands (~25%)", 0.25),
     BodyExposure("tshirt_shorts", "T-shirt and shorts (~40%)", 0.40),
     BodyExposure("swimwear", "Swimwear (~85%)", 0.85),
+    BodyExposure("nude", "Nude (100%)", 1.0),
 )
 DEFAULT_BODY_EXPOSURE = "face_arms"
 
