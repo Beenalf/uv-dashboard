@@ -78,10 +78,9 @@ from uv_dose.vitamin_d import (
     BodyExposure,
     body_exposure,
     iu_range,
-    most_before_burning,
+    most_in_a_day,
     next_goal,
     round_iu,
-    vitamin_d_iu,
 )
 
 SPF_CHOICES: tuple[tuple[str, int], ...] = (("No sunscreen", 1), ("SPF 15", 15), ("SPF 30", 30), ("SPF 50+", 50))
@@ -826,7 +825,7 @@ class App:
         else:
             sunscreen = "For all outings. Most people use half or less."
         _set_if_changed(self.sunscreen_hint, sunscreen)
-        _set_if_changed(self.goal_hint, f"Most you can make: about {_iu_span(most_before_burning(self._body().fraction))}.")
+        _set_if_changed(self.goal_hint, f"Most a day can make: about {_iu_span(most_in_a_day(self._body().fraction))}.")
 
     def _sync_spf_field(self) -> None:
         """While sunscreen is off, the Sunscreen field says so (and is locked); each outing keeps its SPF."""
@@ -974,22 +973,30 @@ class App:
 
         # ---- vitamin D
         body_short = body.label.split(" (")[0].lower()
-        # Production levels off at the burn threshold, so the most a day can give is reached at the
-        # burn time. That time is the same for everyone with this threshold; the amount varies.
-        if plan.burn:
-            most = (f"Most possible: {_iu_span(most_before_burning(body.fraction))}, "
-                    f"at {plan.burn.at:%H:%M} when you'd start to burn.")
+        # The day's most: production levels off (a high sun), or you'd burn first (a low sun makes
+        # little vitamin D per unit of sunburn UV), or neither happens before the data ends.
+        limit = plan.limit
+        if limit and limit.kind == "levels off":
+            most = f"Most possible: {_iu_span(plan.most_iu)}, by {limit.at:%H:%M} when production levels off."
+        elif limit and limit.kind == "burn":
+            most = f"Most before burning: {_iu_span(plan.most_iu)}, by {limit.at:%H:%M}."
         else:
             end = series[-1].time + timedelta(minutes=1)
-            most = (f"Most possible today: {_iu_span(vitamin_d_iu(plan.dose_available, med, body.fraction))}, "
-                    f"by {end:%H:%M} if you stayed out.")
+            most = f"Most possible today: {_iu_span(plan.most_iu)}, by {end:%H:%M} if you stayed out."
         line3 = f"{most} {'All outings' if many else 'Whole window'}: ≈{round_iu(plan.vitd_iu):,} IU."
         title = "Vitamin D · time in the sun" if many else f"Vitamin D · from {first.start:%H:%M}"
         v = plan.vitd
         if plan.vitd_dose_sed is None:
             self.cards["vitd"].show(
-                "Not safely", "", f"{target:,} IU would take more than a burning dose on {body_short}.",
+                "Too high", "", f"{target:,} IU is more than {body_short} can make in a day.",
                 "Expose more skin or lower the goal.", line3,
+                color=p.warning, icon=LEVEL_ICON["moderate"], title=title,
+            )
+        elif v and plan.vitd_after_burn:
+            self.cards["vitd"].show(
+                "Not safely", "",
+                f"≈{target:,} IU by {v.at:%H:%M}, after you'd start to burn at {plan.burn.at:%H:%M}",
+                "Go out nearer midday, expose more skin or lower the goal.", line3,
                 color=p.warning, icon=LEVEL_ICON["moderate"], title=title,
             )
         elif v:
@@ -1093,7 +1100,6 @@ class App:
             tail=tail,
             clear_curve=clear_curve,
             med_sed=med,
-            vitd_sed=plan.vitd_dose_sed,
             burn_at=plan.burn.at if plan.burn else None,
             vitd_at=plan.vitd.at if plan.vitd else None,
             describe=describe,
@@ -1314,11 +1320,12 @@ ARPANSA publishes nothing ahead of time. Press ▶ past today to get a clear-sky
 
 ## Vitamin D
 This uses Holick's rule of thumb, as adopted by Webb & Engelsen (2006): exposing about a quarter of the body (face, arms and hands) to a quarter of your burn threshold makes roughly 1000 IU. In general:
-    IU ≈ 16,000 × (fraction of skin exposed) × (dose / burn threshold), capped at 1 burn-threshold dose.
+    IU ≈ 16,000 × (fraction of skin exposed) × (vitamin D dose / burn threshold), capped at 1 burn-threshold dose.
+Those figures come from UV lamps, whose light makes vitamin D and sunburn in a fixed proportion. Sunlight doesn't: vitamin D needs the shortest UVB, which ozone and the air filter out more when the sun is low, while sunburn also comes from longer wavelengths. So the vitamin D dose is the dose on your skin with each minute weighted by a conversion factor for the sun's height (Pope et al., 2008, scaled so 1 matches the lamps). It is about 1.2 with the sun high in summer, 1 with the sun 35° from overhead, 0.8 at 60° and 0.6 at 70°. Mornings, evenings and winter therefore make less vitamin D for the same sunburn risk. The factor assumes a typical 300 units of ozone; real values over Australia (about 250–350) shift it by about 5% either way.
 Vitamin D production levels off with continued exposure, so short, regular exposure beats long sessions. The "sweet spot" is the time needed to reach your goal. Beyond it, extra sun mostly adds UV damage.
-Caveats: the model treats erythemal UV as a stand-in for vitamin-D-producing UV. That overstates production when the sun is low (early, late and in winter). It ignores age, body size and diet.
+Caveats: the doses are for a flat surface facing the sky, and the model ignores age, body size and diet.
 Choosing a goal: the default of 1,000 IU is Webb & Engelsen's "standard vitamin D dose" for sun exposure. Official intake guidelines are lower: 200–600 IU a day in Australia and New Zealand, rising with age, and 600–800 IU in the US. The Endocrine Society's 2011 guideline suggested 1,500–2,000 IU for adults to keep blood levels up, but its 2024 update no longer advises more than the official amounts for healthy adults under 75. The goal's arrows step from 1,000 to 10,000 IU, and you can type any other value.
-The most you can make: production levels off at about one burning dose, so a day's most is reached when the dose on your skin reaches your burn threshold, at your burn time. That time depends only on the UV and your burn threshold, not on how much vitamin D your skin makes from a dose. The amount does vary from person to person: one burning dose over the whole body is often quoted as making 10,000–25,000 IU (Holick), so the app gives the most as a range. Its middle estimate, used for the goal times, is 16,000 IU × the fraction of skin exposed: about 4,000 IU with face, arms and hands (range 2,500–6,300), about 13,600 IU in swimwear (8,500–21,000), and about 16,000 IU nude (10,000–25,000).
+The most you can make: production levels off once the vitamin D dose reaches about one burn-threshold dose. With the sun high that happens before you would burn, so the card gives the time it levels off. With the sun low you would burn first, so the most you can make safely is less, and the card gives the amount by your burn time. The amount also varies from person to person: one burning dose over the whole body is often quoted as making 10,000–25,000 IU (Holick), so the app gives the most as a range. Its middle estimate, used for the goal times, is 16,000 IU × the fraction of skin exposed at the plateau: about 4,000 IU with face, arms and hands (range 2,500–6,300), about 13,600 IU in swimwear (8,500–21,000), and about 16,000 IU nude (10,000–25,000).
 Higher goals need more bare skin rather than more time. The skin can't make too much vitamin D, because production levels off, but UV damage keeps adding up. Vitamin D also lasts for weeks in the body, so a good dose on some days covers days with less.
 
 ## Measured vs clear-sky forecast

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import tkinter as tk
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from datetime import datetime, timedelta
@@ -54,7 +55,7 @@ MARGIN_LEFT_PT = 38
 MARGIN_TOP_PT = 24
 MARGIN_BOTTOM_PT = 19
 PANEL_GAP_PT = 12
-RIGHT_LABELS = tuple(c.name for c in UV_CATEGORIES) + ("Burn threshold", "Vitamin D goal")
+RIGHT_LABELS = tuple(c.name for c in UV_CATEGORIES) + ("Burn threshold",)
 RIGHT_LABEL_OFFSET_PT = 5  # gap between a panel's right edge and the labels in the margin
 HOURLY_TICKS_MIN_WIDTH = 760  # px; narrower charts label every second hour
 
@@ -77,13 +78,29 @@ class ChartView:
     clear_curve: tuple[list[datetime], list[float]] = ((), ())  # clear-sky equivalent, for comparison
     dose_label: str = "Dose on your skin"
     med_sed: float = 2.5
-    vitd_sed: float | None = None
     burn_at: datetime | None = None
+    # When the vitamin D goal is reached. It has no line of its own: the panel shows the sunburn
+    # dose, and the vitamin D dose grows at a different rate (slower when the sun is low).
     vitd_at: datetime | None = None
     message: str | None = None  # shown instead of data (no data / loading / error)
     # Hover readout text. A new function each time, so it doesn't count when comparing views.
     describe: Callable[[datetime], str] | None = field(default=None, compare=False)
     hint: str = "Drag to pick a time window · click to set the start"
+
+
+def _curve_value(v: ChartView, when: datetime | None) -> float | None:
+    """The dose curve's value at ``when`` (in the outings or the stay-out tail), or None outside it."""
+    if when is None:
+        return None
+    for times, values in (v.curve, v.tail):
+        if times and times[0] <= when <= times[-1]:
+            i = bisect_left(times, when)
+            if i == 0:
+                return values[0]
+            t0, t1 = times[i - 1], times[i]
+            f = (when - t0) / (t1 - t0) if t1 > t0 else 1.0
+            return values[i - 1] + f * (values[i] - values[i - 1])
+    return None
 
 
 def _hhmm(x: float, pos: int | None = None) -> str:
@@ -257,21 +274,20 @@ class DoseChart:
             ax2.plot(kt, kv, color=p.forecast, lw=1.1, ls=DASH_FORECAST,
                      label="Same outings, clear sky" if len(v.outings) > 1 else "Same window, clear sky", zorder=2)
 
+        vitd_level = _curve_value(v, v.vitd_at)  # keep its marker below the legend, like the burn's
         top = max(v.med_sed * 1.3, (cv[-1] if cv else 0) * 1.15, (kv[-1] if kv else 0) * 1.05,
-                  (v.vitd_sed or 0) * 1.3, 0.5)
+                  (vitd_level or 0) * 1.3, 0.5)
         ax2.set_ylim(0, top)
-        vitd_line = v.vitd_sed if v.vitd_sed is not None and v.vitd_sed < top else None
         ax2.axhline(v.med_sed, color=p.critical, lw=1.1, ls=DASH_THRESHOLD, zorder=1.5)
-        if vitd_line is not None:
-            ax2.axhline(vitd_line, color=p.good, lw=1.1, ls=DASH_THRESHOLD, zorder=1.5)
-        self._label_thresholds(v.med_sed, vitd_line)
+        self._label_thresholds(v.med_sed)
 
-        # Event labels. The vitamin D time always comes before the burn time, so its label goes
-        # left of its marker and the burn label above-left of its own (the curve is below there).
-        # Labels near the left edge flip to the right side.
+        # Event labels. The vitamin D marker sits on the dose curve at its time. Its label goes
+        # left of the marker, or right if it comes after the burn (whose label is above-left of
+        # its own marker; the curve is below there). Labels near the left edge flip right.
         span = (v.day_end - v.day_start) or timedelta(hours=1)
+        vitd_after_burn = v.vitd_at is not None and v.burn_at is not None and v.vitd_at > v.burn_at
         for when, level, color, text, upper in (
-            (v.vitd_at, v.vitd_sed, p.good, "Vitamin D", False),
+            (v.vitd_at, vitd_level, p.good, "Vitamin D", False),
             (v.burn_at, v.med_sed, p.critical, "Burn", True),
         ):
             if when is None or level is None:
@@ -283,7 +299,8 @@ class DoseChart:
             if upper:
                 xytext, ha, va = ((8, -5), "left", "top") if near_left else ((-6, 5), "right", "bottom")
             else:
-                xytext, ha, va = ((8, 0), "left", "center") if near_left else ((-8, 0), "right", "center")
+                xytext, ha, va = (((8, 0), "left", "center") if near_left or vitd_after_burn
+                                  else ((-8, 0), "right", "center"))
             ax2.annotate(f"{text} {when:%H:%M}", (when, level), xytext=xytext, textcoords="offset points",
                          va=va, ha=ha, fontsize=8, color=p.ink, fontweight="bold", zorder=6,
                          bbox={"boxstyle": "round,pad=0.25", "fc": p.surface, "ec": "none", "alpha": 0.85})
@@ -373,14 +390,14 @@ class DoseChart:
         ax.plot([start, end], [0.018, 0.018], transform=tf, color=PROTECTION_COLOR, lw=5, solid_capstyle="butt",
                 zorder=1.8, label=f"Sun protection {start:%H:%M}–{end:%H:%M} (UV 3+)")
 
-    def _label_thresholds(self, med: float, vitd: float | None) -> None:
-        """Name the threshold lines in the right margin (like the UV bands above)."""
+    def _label_thresholds(self, med: float) -> None:
+        """Name the threshold line in the right margin (like the UV bands above)."""
         tf = blended_transform_factory(self.ax_dose.transAxes, self.ax_dose.transData)
         self._threshold_labels = [
             (self.ax_dose.annotate(text, (1, y), xycoords=tf, xytext=(RIGHT_LABEL_OFFSET_PT, 0),
                                    textcoords="offset points", ha="left", va="center", fontsize=8,
                                    color=self.palette.ink2, annotation_clip=False), y)
-            for text, y in (("Vitamin D goal", vitd), ("Burn threshold", med)) if y is not None
+            for text, y in (("Burn threshold", med),)
         ]
         self._place_threshold_labels()
 

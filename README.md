@@ -45,7 +45,10 @@ Needs Python 3.13+ (with Tk, which the python.org and uv builds include).
   10,000 IU (or any amount you type) for the skin you expose. It is the "sweet spot"
   before extra sun mostly adds damage, and the app says when a goal needs more bare
   skin than you have chosen. It also gives the most you could make that day, as a
-  range because people differ, and the time you'd reach it (your burn time).
+  range because people differ, and when you'd reach it. Vitamin D is worked out
+  from the vitamin D-producing part of the UV, which falls off faster than the
+  sunburning part when the sun is low (mornings, evenings and winter), using
+  conversion factors for the sun's height from Pope et al. (2008).
 - **Hourly table**, which you can copy as CSV. The window has its own light and dark
   looks (dark is in the ☰ menu), and your settings are remembered (in
   `%APPDATA%\uv-dose\settings.json` on Windows).

@@ -26,6 +26,8 @@ from enum import StrEnum
 from typing import Literal, Sequence
 
 from uv_dose.arpansa import DayData
+from uv_dose.sun import cos_zenith
+from uv_dose.vitamin_d import vitamin_d_factor
 
 UVI_WATTS_PER_M2 = 0.025
 SED_JOULES_PER_M2 = 100.0
@@ -48,17 +50,19 @@ class UVPoint:
     time: datetime  # start of the minute
     uvi: float
     kind: PointKind
+    vitd_factor: float = 1.0  # vitamin D per unit of sunburn UV at this minute's sun angle (vitamin_d_factor)
 
 
 def build_series(day: DayData, source: Source = Source.BEST) -> list[UVPoint]:
+    factors = [vitamin_d_factor(mu) for mu in cos_zenith(day.site, day.day, [s.time for s in day.samples])]
     points: list[UVPoint] = []
-    for s in day.samples:
+    for s, f in zip(day.samples, factors):
         if source is Source.BEST and s.measured is not None:
-            points.append(UVPoint(s.time, s.measured, "measured"))
+            points.append(UVPoint(s.time, s.measured, "measured", f))
         elif s.forecast is not None:
-            points.append(UVPoint(s.time, s.forecast, "forecast"))
+            points.append(UVPoint(s.time, s.forecast, "forecast", f))
         else:
-            points.append(UVPoint(s.time, 0.0, "missing"))
+            points.append(UVPoint(s.time, 0.0, "missing", f))
     return points
 
 
