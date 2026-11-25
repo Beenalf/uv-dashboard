@@ -148,7 +148,7 @@ class DayPlan:
     vitd_dose_sed: float | None  # vitamin D dose the goal needs; None: more than the skin can make in a day
     vitd: Crossing | None
     dose_available: float  # skin dose over the outings plus staying out after the last one
-    relies_on_forecast: bool  # part of the span up to the burn time comes from the clear-sky forecast
+    relies_on_forecast: bool  # part of the span up to the burn time has no reading (forecast or likely UV)
     vitd_doses: tuple[float, ...] = ()  # vitamin D dose on the skin per outing
     limit: VitaminDLimit | None = None
 
@@ -179,6 +179,10 @@ class DayPlan:
     @property
     def missing_minutes(self) -> int:
         return sum(w.missing_minutes for w in self.windows)
+
+    @property
+    def likely_minutes(self) -> int:
+        return sum(w.likely_minutes for w in self.windows)
 
     @property
     def peak(self) -> WindowDose | None:
@@ -313,6 +317,7 @@ class PlanHour:
     skin_cumulative_sed: float  # on the skin, running across all outings
     forecast_minutes: int
     missing_minutes: int
+    likely_minutes: int = 0
 
 
 def plan_hours(series: Sequence[UVPoint], outings: Sequence[Outing]) -> list[PlanHour]:
@@ -326,5 +331,5 @@ def plan_hours(series: Sequence[UVPoint], outings: Sequence[Outing]) -> list[Pla
             ambient += r.sed
             skin += r.sed * o.factor
             rows.append(PlanHour(i, r.start, r.end, r.minutes, r.mean_uvi, r.peak_uvi, r.sed, ambient, skin,
-                                 r.forecast_minutes, r.missing_minutes))
+                                 r.forecast_minutes, r.missing_minutes, r.likely_minutes))
     return rows

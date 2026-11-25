@@ -25,6 +25,7 @@ from uv_dose.arpansa import (
     Site,
     sort_sites,
 )
+from uv_dose.clouds import OPEN_METEO_HOME, CloudForecast, CloudOutlook, OpenMeteoClient, cloud_outlook
 from uv_dose.dose import (
     ProtectionTimes,
     Source,
@@ -70,7 +71,7 @@ from uv_dose.gui.widgets import (
     fmt_duration,
     parse_time,
 )
-from uv_dose.planner import DayPlan, Outing, plan_curves, plan_day, plan_hours, value_at
+from uv_dose.planner import Crossing, DayPlan, Outing, plan_curves, plan_day, plan_hours, value_at
 from uv_dose.settings import Settings
 from uv_dose.skin import SKIN_TYPES, SkinType, skin_type
 from uv_dose.vitamin_d import (
@@ -88,19 +89,25 @@ SPF_OFF_LABEL = "Off (Applied is None)"  # shown instead of the outing's SPF whi
 AUTO_REFRESH_MS = 120_000
 RECOMPUTE_DELAY_MS = 50  # lets a burst of changes (e.g. a held spinbox arrow) update the results once
 CARDS_ONE_ROW_MIN_WIDTH = 880  # px; below this the result cards wrap into a 2 x 2 grid
+BURN_TIMES_APART = timedelta(minutes=3)  # closer than this, the likely and if-it-clears burn times show as one
 APP_TITLE = "UV Dose"
 
 
 class App:
-    def __init__(self, root: tk.Tk, client: ArpansaClient, settings: Settings) -> None:
+    def __init__(self, root: tk.Tk, client: ArpansaClient, settings: Settings,
+                 clouds: OpenMeteoClient | None = None) -> None:
         self.root = root
         self.client = client
+        self.clouds = clouds or OpenMeteoClient()
         self.settings = settings
         self.palette: Palette = apply_ttk_theme(root, settings.dark)
 
         self.sites: list[Site] = sort_sites(FALLBACK_SITES)
         self.site: Site = self._site_by_code(settings.site_code)
         self.day: DayData | None = None
+        # Open-Meteo's cloud forecast for the shown site, for the likely UV later today (or tomorrow).
+        self.cloud_forecast: CloudForecast | None = None
+        self._cloud_error: str | None = None
         self._first_load = True
         self._request_id = 0
         self._jobs: queue.Queue[tuple[Callable[[Any], None], Any]] = queue.Queue()
@@ -325,7 +332,7 @@ class App:
         hint(self.goal_hint)
 
         section("UV data")
-        ttk.Radiobutton(side, text="Measured (forecast fills any gaps)", value=Source.BEST.value,
+        ttk.Radiobutton(side, text="Measured, then forecast with cloud", value=Source.BEST.value,
                         variable=self.source_var, command=self._schedule_recompute).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=2)
         r += 1
@@ -407,7 +414,8 @@ class App:
         ttk.Label(footer, text="UV observations courtesy of ARPANSA.", style="Muted.TLabel",
                   font=f["caption"]).pack(side="left")
         self._links: list[ttk.Label] = []
-        for text, cmd in (("Data disclaimer", self._show_disclaimer), ("How the calculations work", self._show_help)):
+        for text, cmd in (("Weather data by Open-Meteo.com", lambda: webbrowser.open(OPEN_METEO_HOME)),
+                          ("Data disclaimer", self._show_disclaimer), ("How the calculations work", self._show_help)):
             link = ttk.Label(footer, text=text, cursor="hand2", font=f["caption"], foreground=self.palette.link)
             link.pack(side="left", padx=(12, 0))
             link.bind("<Button-1>", lambda e, c=cmd: c())
@@ -566,7 +574,7 @@ class App:
         elif live and latest:
             self.status_var.set(f"Live · latest reading {latest.time:%H:%M}")
         elif day.outlook_from:
-            self.status_var.set("Clear-sky outlook")
+            self.status_var.set("Outlook")
         elif day.has_measurements:
             self.status_var.set("Measured data")
         else:
@@ -581,6 +589,37 @@ class App:
             self._pending_start_now = False
             self._start_now()  # "Start now" was pressed on another day: apply it now today has loaded
         self._recompute()
+        self._load_clouds(day)
+
+    def _wants_clouds(self, day: DayData) -> bool:
+        """Today while readings are still to come, or a day ahead."""
+        return day.day >= date.today() and not day.is_complete
+
+    def _load_clouds(self, day: DayData) -> None:
+        """Fetch the cloud forecast for ``day``'s site in the background (the client caches it).
+
+        The day shows straight away with what's known; the likely UV follows when this arrives.
+        """
+        if not self._wants_clouds(day):
+            return
+        site = day.site
+
+        def ok(forecast: CloudForecast) -> None:
+            changed = forecast is not self.cloud_forecast or self._cloud_error is not None
+            self.cloud_forecast, self._cloud_error = forecast, None
+            if changed and self.day is not None and self.day.site.code == site.code:
+                self._recompute()
+
+        def err(exc: Exception) -> None:
+            if self.cloud_forecast is not None and self.cloud_forecast.site_code != site.code:
+                self.cloud_forecast = None  # another site's: of no use here
+            message = str(exc).split(" (")[0]
+            if message != self._cloud_error:
+                self._cloud_error = message
+                if self.day is not None and self.day.site.code == site.code:
+                    self._recompute()
+
+        self._submit(lambda: self.clouds.forecast(site), ok, err)
 
     def _show_message(self, message: str) -> None:
         d = self.date_ctl.value
@@ -864,13 +903,24 @@ class App:
             self._fill_outing_list(None, 0)
             return
         source = Source(self.source_var.get())
-        series = build_series(day, source)
+        # Later today (or a day ahead) the UV is likely UV: the clear-sky forecast scaled for cloud.
+        outlook = (cloud_outlook(day, self.cloud_forecast)
+                   if source is Source.BEST and self._wants_clouds(day) else None)
+        series = build_series(day, source, outlook)
         pairs = self._resolve(day)
         self._resolved = pairs
         skin, med, body, target = self._skin(), self._med(), self._body(), self._target_iu()
-        plan = plan_day(series, [o for _, o in pairs], med_sed=med, target_iu=target, body_fraction=body.fraction)
+        outings = [o for _, o in pairs]
+        plan = plan_day(series, outings, med_sed=med, target_iu=target, body_fraction=body.fraction)
         selected = self.outings.index(self.sel)
-        protection = sun_protection_times(series)
+        # The cautious case: the sky clears from now on (the measurements so far, then the clear-sky
+        # forecast). Burn times show it alongside the likely time, and sun protection times use it.
+        if_clear = None
+        cautious_series = series
+        if outlook is not None:
+            cautious_series = build_series(day, source)
+            if_clear = plan_day(cautious_series, outings, med_sed=med, target_iu=target, body_fraction=body.fraction)
+        protection = sun_protection_times(cautious_series)
         clear = None
         if source is Source.BEST and day.has_forecast and plan.minutes > plan.forecast_minutes:
             clear_series = build_series(day, Source.CLEAR_SKY)
@@ -878,9 +928,9 @@ class App:
                                        for o in plan.outings))  # on the skin, like the headline
 
         self._fill_outing_list(plan, selected)
-        self._fill_cards(series, source, plan, protection, clear, skin, med, body, target)
-        self._fill_note(day, source, plan)
-        self._fill_chart(day, series, source, plan, selected, protection, clear, med)
+        self._fill_cards(series, source, plan, protection, clear, skin, med, body, target, if_clear)
+        self._fill_note(day, source, plan, outlook)
+        self._fill_chart(day, series, source, plan, selected, protection, clear, med, if_clear, cautious_series)
         self._fill_table(series, plan)
         self._save_settings_soon()
 
@@ -907,7 +957,8 @@ class App:
         return ", ".join(words[:-1]) + (" and " if len(words) > 1 else "") + words[-1] if words else ""
 
     def _fill_cards(self, series, source, plan: DayPlan, protection: ProtectionTimes | None, clear, skin, med,
-                    body, target) -> None:
+                    body, target, if_clear: DayPlan | None = None) -> None:
+        """Fill the four cards. ``plan`` uses likely UV ahead; ``if_clear`` is the same plan if the sky clears."""
         p = self.palette
         many = len(plan.outings) > 1
         first, last = plan.outings[0], plan.outings[-1]
@@ -924,7 +975,8 @@ class App:
         else:
             line1 = f"{plan.ambient_sed * 100:,.0f} J/m²" + (" in total" if many else f" over {sun}")
         extra = [rating.advice]
-        if clear and clear[1] > 0.05:
+        ahead = if_clear is not None and if_clear.skin_sed - plan.skin_sed >= 0.005  # likely UV still to come
+        if clear and clear[1] > 0.05 and not ahead:
             ratio = plan.skin_sed / clear[1]
             if ratio < 0.95:
                 extra.append(f"Cloud cut this by {1 - ratio:.0%} (clear sky: {clear[1]:.1f} SED).")
@@ -934,6 +986,10 @@ class App:
                 extra.append("About the same as a clear-sky day.")
         if plan.forecast_minutes and source is Source.BEST and plan.forecast_minutes < plan.minutes:
             extra.append(f"{plan.forecast_minutes} min from the clear-sky forecast.")
+        if ahead:
+            worst = rate_dose(if_clear.skin_sed, med)
+            level = f" ({worst.label.lower()})" if worst.level != rating.level else ""
+            extra.append(f"Up to {if_clear.skin_sed:.2f} SED{level} if it clears.")
         self.cards["dose"].show(
             f"{plan.skin_sed:.2f}", "SED", line1,
             f"{rating.label} · {rating.fraction_of_med:.0%} of your burn threshold",
@@ -942,12 +998,17 @@ class App:
         )
 
         # ---- burn
+        # With cloud expected, the headline is the cautious time (if it clears) and the likely
+        # time follows. Burning sooner than shown is the costly mistake, and cloud can clear.
         who = f"Type {skin.roman}, {med:g} SED"
         notes = []
-        if plan.relies_on_forecast:
-            notes.append("Includes clear-sky forecast; cloud would make it later.")
         title = "Time to burn · time in the sun" if many else f"Time to burn · from {first.start:%H:%M}"
-        b = plan.burn
+        b, likely, two = _burn_times(plan, if_clear)
+        if two:
+            notes.append(f"Allowing for cloud: likely {likely.at:%H:%M} ({fmt_duration(likely.sun_time)})."
+                         if likely else "Allowing for cloud: likely not today.")
+        elif plan.relies_on_forecast and not if_clear and plan.likely_minutes == 0:
+            notes.append("Includes clear-sky forecast; cloud would make it later.")
         if b:
             inside = b.outing is not None
             where = f", in your {plan.outings[b.outing].start:%H:%M} outing" if many and inside else ""
@@ -960,13 +1021,16 @@ class App:
                     and b.sun_time > timedelta(hours=REAPPLY_HOURS)):
                 notes.append(f"Reapply sunscreen every {REAPPLY_HOURS} hours.")
             self.cards["burn"].show(
-                fmt_duration(b.sun_time), "", f"Burn threshold at {b.at:%H:%M}{where} ({who})", advice,
+                fmt_duration(b.sun_time), "",
+                f"Burn threshold at {b.at:%H:%M}{' if it clears' if two else ''}{where} ({who})", advice,
                 " ".join(notes), color=p.critical if inside else p.good,
                 icon=LEVEL_ICON["very_high"] if inside else LEVEL_ICON["low"], title=title,
             )
         else:
+            available = (if_clear or plan).dose_available
             self.cards["burn"].show(
-                "Not today", "", f"At most {plan.dose_available:.1f} SED on your skin ({who})",
+                "Not today", "",
+                f"At most {available:.1f} SED on your skin{', even if it clears' if if_clear else ''} ({who})",
                 "Stays under your burn threshold for the rest of the day.", " ".join(notes),
                 color=p.good, icon=LEVEL_ICON["low"], title=title,
             )
@@ -1001,7 +1065,9 @@ class App:
             )
         elif v:
             where = f", in your {plan.outings[v.outing].start:%H:%M} outing" if many and v.outing is not None else ""
-            margin = (f"Sweet spot: before your burn time ({fmt_duration(plan.burn.sun_time)})." if plan.burn
+            burn, _, two = _burn_times(plan, if_clear)  # as on the burn card
+            clears = " if it clears" if two else ""
+            margin = (f"Sweet spot: before your burn time ({fmt_duration(burn.sun_time)}{clears})." if burn
                       else "Sweet spot, with no burn risk today.")
             self.cards["vitd"].show(
                 fmt_duration(v.sun_time), "", f"≈{target:,} IU by {v.at:%H:%M} with {body_short}{where}",
@@ -1031,16 +1097,35 @@ class App:
         else:
             self.cards["uv"].show("–", "", "No readings", prot, title=title)
 
-    def _fill_note(self, day: DayData, source: Source, plan: DayPlan) -> None:
+    def _fill_note(self, day: DayData, source: Source, plan: DayPlan, outlook: CloudOutlook | None = None) -> None:
         latest = day.latest_measured
-        if day.outlook_from:
+        if day.outlook_from and outlook:
+            note = (f"Outlook: ARPANSA's clear-sky forecast for today ({day.outlook_from:%a %d %b}), used as a "
+                    "stand-in for this day and scaled by Open-Meteo's cloud forecast. Burn times also show "
+                    "the time if it's clear.")
+        elif day.outlook_from:
             note = (f"Outlook: ARPANSA's clear-sky forecast for today ({day.outlook_from:%a %d %b}), "
-                    "used as a stand-in for this day. Cloud would make real UV lower.")
+                    "used as a stand-in for this day. Cloud would make real UV lower."
+                    + (f" No cloud forecast ({_lower_first(self._cloud_error)})." if self._cloud_error else ""))
         elif source is Source.CLEAR_SKY:
             note = "Showing ARPANSA's clear-sky forecast: the most UV a cloudless day would bring."
         elif not day.has_measurements:
             note = ("No measurements for this day, so ARPANSA's clear-sky forecast is used: "
                     "the most UV a cloudless day would bring.")
+        elif not day.is_complete and day.day == date.today() and outlook:
+            until = f"Measured by ARPANSA until {latest.time:%H:%M}. After that, likely UV: " if latest else (
+                "No readings yet today. Likely UV: ")
+            if outlook.recent is not None and outlook.forecast is not None:
+                how = (f"the clear-sky forecast scaled for cloud, from the last hour's ({outlook.recent:.0%} of "
+                       "clear sky) blending into Open-Meteo's cloud forecast over the next couple of hours.")
+            elif outlook.forecast is not None:
+                how = "the clear-sky forecast scaled by Open-Meteo's cloud forecast."
+            else:
+                how = (f"the clear-sky forecast scaled by the last hour's cloud ({outlook.recent:.0%} of clear sky), "
+                       "fading back to clear sky over the next few hours"
+                       + (f". No cloud forecast ({_lower_first(self._cloud_error)})." if self._cloud_error else "."))
+            note = (until + how + f" Burn times also show the time if it clears. New readings load every "
+                    f"{AUTO_REFRESH_MS // 60_000} minutes.")
         elif not day.is_complete and latest and day.day == date.today():
             note = (f"Measured by ARPANSA until {latest.time:%H:%M}. After that the clear-sky forecast is used, "
                     f"so real UV may be lower if cloud comes over. New readings load every "
@@ -1057,11 +1142,23 @@ class App:
         self.note_var.set(note)
 
     def _fill_chart(self, day, series: list[UVPoint], source, plan: DayPlan, selected: int,
-                    protection: ProtectionTimes | None, clear, med) -> None:
+                    protection: ProtectionTimes | None, clear, med, if_clear: DayPlan | None = None,
+                    cautious_series: list[UVPoint] | None = None) -> None:
         latest = day.latest_measured
         live = not day.is_complete and latest is not None and day.day == date.today()
         curve, tail = plan_curves(series, plan.outings)
-        clear_curve = plan_curves(clear[0], plan.outings)[0] if clear else ([], [])
+        # For comparison: the dose if the sky clears from now on, while likely UV is still to come;
+        # otherwise the dose on a clear-sky day.
+        clear_curve, clear_label = ([], []), None
+        if if_clear and cautious_series and plan.likely_minutes:
+            cautious = plan_curves(cautious_series, plan.outings)[0]
+            if cautious[1] and curve[1] and cautious[1][-1] - curve[1][-1] >= 0.005:
+                clear_curve, clear_label = cautious, "If it clears"
+        if not clear_curve[0] and clear:
+            clear_curve = plan_curves(clear[0], plan.outings)[0]
+        burn, likely_burn, two = _burn_times(plan, if_clear)
+        marked_burn = likely_burn if two else burn  # the filled marker, on the dose curve
+        likely = {p.time: p.uvi for p in series if p.kind == "likely"}
         many = len(plan.outings) > 1
         first, last_end = plan.outings[0].start, plan.outings[-1].end
         samples = {s.time: s for s in day.samples}
@@ -1073,6 +1170,8 @@ class App:
             parts = [f"{t:%H:%M}"]
             if s.measured is not None:
                 parts.append(f"UV {s.measured:.1f} ({uv_category(s.measured).name.lower()})")
+            if t in likely:
+                parts.append(f"likely UV {likely[t]:.1f} ({uv_category(likely[t]).name.lower()})")
             if s.forecast is not None:
                 parts.append(f"clear sky {s.forecast:.1f}")
             if t > first:
@@ -1083,7 +1182,8 @@ class App:
                     parts.append(f"{dose:.2f} SED on skin {since}")
             return "  ·  ".join(parts)
 
-        title = f"{day.site.name} · {day.day:%a %d %b %Y}" + (" · clear-sky outlook" if day.outlook_from else "")
+        outlook_kind = "outlook with cloud" if likely else "clear-sky outlook"
+        title = f"{day.site.name} · {day.day:%a %d %b %Y}" + (f" · {outlook_kind}" if day.outlook_from else "")
         self.chart.render(ChartView(
             title=title,
             day_start=day.first_time,
@@ -1091,6 +1191,7 @@ class App:
             times=[s.time for s in day.samples],
             measured=[s.measured for s in day.samples],
             forecast=[s.forecast for s in day.samples],
+            likely=[likely.get(s.time) for s in day.samples] if likely else [],
             show_measured=source is Source.BEST and day.has_measurements,
             latest_reading=latest.time if live else None,
             outings=[(o.start, o.end) for _, o in self._resolved],
@@ -1099,8 +1200,10 @@ class App:
             curve=curve,
             tail=tail,
             clear_curve=clear_curve,
+            clear_label=clear_label,
             med_sed=med,
-            burn_at=plan.burn.at if plan.burn else None,
+            burn_at=marked_burn.at if marked_burn else None,
+            burn_clear_at=burn.at if two else None,
             vitd_at=plan.vitd.at if plan.vitd else None,
             describe=describe,
             **({"hint": "Drag to set times · click an outing to edit it"} if many else {}),
@@ -1114,6 +1217,8 @@ class App:
             notes = []
             if row.forecast_minutes:
                 notes.append(f"clear-sky forecast {row.forecast_minutes} min")
+            if row.likely_minutes:
+                notes.append(f"likely, with cloud {row.likely_minutes} min")
             if row.missing_minutes:
                 notes.append(f"no data {row.missing_minutes} min")
             self.table.insert("", "end", values=(
@@ -1142,12 +1247,13 @@ class App:
         buf = io.StringIO()
         w = csv.writer(buf, lineterminator="\n")
         w.writerow(["site", "date", "outing", "from", "to", "minutes", "mean_uvi", "peak_uvi", "dose_sed",
-                    "running_total_sed", "on_skin_running_total_sed", "forecast_minutes", "missing_minutes"])
+                    "running_total_sed", "on_skin_running_total_sed", "forecast_minutes", "missing_minutes",
+                    "likely_minutes"])
         for r in self._hour_rows:
             w.writerow([self.site.name, r.start.date().isoformat(), r.outing + 1, f"{r.start:%H:%M}",
                         f"{r.end:%H:%M}", r.minutes, f"{r.mean_uvi:.2f}", f"{r.peak_uvi:.2f}", f"{r.sed:.3f}",
                         f"{r.cumulative_sed:.3f}", f"{r.skin_cumulative_sed:.3f}", r.forecast_minutes,
-                        r.missing_minutes])
+                        r.missing_minutes, r.likely_minutes])
         self.root.clipboard_clear()
         self.root.clipboard_append(buf.getvalue())
         self.status_var.set("Table copied as CSV")
@@ -1216,6 +1322,23 @@ class App:
         self.root.destroy()
 
 
+def _burn_times(plan: DayPlan, if_clear: DayPlan | None) -> tuple[Crossing | None, Crossing | None, bool]:
+    """The burn time to lead with, the likely one, and whether they differ enough to show both.
+
+    The lead is the cautious time: if the sky clears (when there's cloud to allow for),
+    otherwise the plan's own.
+    """
+    likely = plan.burn
+    cautious = if_clear.burn if if_clear else likely
+    two = (if_clear is not None and cautious is not None
+           and (likely is None or likely.at - cautious.at >= BURN_TIMES_APART))
+    return cautious, likely, two
+
+
+def _lower_first(text: str) -> str:
+    return text[:1].lower() + text[1:]
+
+
 def _iu_span(central_iu: float) -> str:
     """A vitamin D amount as the range across people, e.g. "2,500–6,300 IU"."""
     lo, hi = iu_range(central_iu)
@@ -1271,6 +1394,7 @@ def _round_down_5(t: datetime) -> datetime:
 DISCLAIMER_TEXT = """
 ## Source
 UV observations courtesy of ARPANSA (Australian Radiation Protection and Nuclear Safety Agency).
+Cloud forecasts: weather data by Open-Meteo.com (CC BY 4.0), from NOAA's GFS weather model.
 
 ## ARPANSA's disclaimer
 This data is presented by ARPANSA for the purpose of disseminating information about solar ultraviolet radiation levels, free of charge, for the benefit of the public. Nothing contained on this website, or the data presented, is intended to be used as a substitute for a health professional's advice. ARPANSA does not accept any liability for any injury, loss, damage or costs incurred, or any consequences resulting directly or indirectly by use of or reliance on the information.
@@ -1299,6 +1423,7 @@ The burn threshold (minimal erythemal dose, MED) defaults to 2, 2.5, 3, 4.5, 6 a
 
 ## Time to burn
 This is the time in the sun from your start until the dose on your skin reaches your burn threshold, following the real UV curve rather than assuming constant UV. If that doesn't happen within your window, the app carries on as if you stayed out, to show how much longer you could stay.
+When cloud is expected later in the day (see "Cloud later today"), there are two times: if the sky clears, and the likely time with the cloud forecast. The card leads with the first, because cloud can clear without warning and burning sooner than expected is the costly mistake. The chart marks both: a hollow dot if it clears and a filled dot for the likely time.
 
 ## Several outings
 Sunburn and vitamin D depend on the total dose over the day, so "+ Add an outing" lets you plan a day in pieces, such as a morning walk and a lunch break. The doses add up. The burn and vitamin D times then count only the time spent outside, and say which outing they fall in. Each outing has its own shade, ground and sunscreen. Pick one in the list, or click it on the chart, to edit it. If outings overlap, the shared minutes count once.
@@ -1313,10 +1438,10 @@ SPF ratings assume a thick layer (2 mg/cm², about a teaspoon per limb). Most pe
 These are rough, typical figures, not measurements of your spot.
 
 ## Sun protection times
-Cancer Council and ARPANSA recommend sun protection whenever the UV Index is 3 or above. The chart marks that part of the day along the bottom of the UV panel, and the Peak UV card gives the times. They come from the UV data shown, so on a cloudy day they reflect what was measured.
+Cancer Council and ARPANSA recommend sun protection whenever the UV Index is 3 or above. The chart marks that part of the day along the bottom of the UV panel, and the Peak UV card gives the times. They come from the UV data shown, so on a cloudy day they reflect what was measured. Later today they assume the sky clears, to be safe.
 
 ## Tomorrow's outlook
-ARPANSA publishes nothing ahead of time. Press ▶ past today to get a clear-sky outlook for tomorrow, made from today's clear-sky forecast. A clear-sky curve barely changes from one day to the next. The outlook allows for daylight saving starting or ending. It shows a cloudless day, so it is a cautious guide for sunburn and an optimistic one for vitamin D.
+ARPANSA publishes nothing ahead of time. Press ▶ past today to get an outlook for tomorrow, made from today's clear-sky forecast. A clear-sky curve barely changes from one day to the next. The outlook allows for daylight saving starting or ending. It is then scaled by tomorrow's cloud forecast, as for later today (below), and the burn card also gives the time if it's clear. Without a cloud forecast it shows a cloudless day, which is a cautious guide for sunburn and an optimistic one for vitamin D.
 
 ## Vitamin D
 This uses Holick's rule of thumb, as adopted by Webb & Engelsen (2006): exposing about a quarter of the body (face, arms and hands) to a quarter of your burn threshold makes roughly 1000 IU. In general:
@@ -1329,7 +1454,16 @@ The most you can make: production levels off once the vitamin D dose reaches abo
 Higher goals need more bare skin rather than more time. The skin can't make too much vitamin D, because production levels off, but UV damage keeps adding up. Vitamin D also lasts for weeks in the body, so a good dose on some days covers days with less.
 
 ## Measured vs clear-sky forecast
-"Measured" uses ARPANSA's readings, and for any minute without one (for example later today) it uses ARPANSA's clear-sky forecast. While today's readings are coming in, the app loads new ones every 2 minutes. Press Refresh (F5) to load them straight away; the status at the top then says how many came in. "Clear-sky forecast" shows the most UV a cloudless day would bring. That is a cautious figure for sunburn and an optimistic one for vitamin D.
+"Measured, then forecast with cloud" uses ARPANSA's readings. Later today it uses likely UV (see "Cloud later today"), and for any other minute without a reading it uses ARPANSA's clear-sky forecast. While today's readings are coming in, the app loads new ones every 2 minutes. Press Refresh (F5) to load them straight away; the status at the top then says how many came in. "Clear-sky forecast" shows the most UV a cloudless day would bring. That is a cautious figure for sunburn and an optimistic one for vitamin D.
+
+## Cloud later today
+ARPANSA's clear-sky forecast assumes no cloud, so on its own it can overstate the UV still to come on a cloudy day two- or threefold. For the minutes after the latest reading, the app uses likely UV instead: the clear-sky forecast times the share of it expected to get through the cloud. That share blends two estimates:
+    the last hour: the UV measured over the last hour as a share of its clear-sky forecast. Cloud changes slowly, so this is the better guess for the next hour or so.
+    the cloud forecast: Open-Meteo's hourly UV forecast with cloud as a share of its forecast without (from NOAA's GFS weather model). This is better from a couple of hours ahead.
+The last hour's share counts fully at first and hands over to the forecast as the time ahead grows (its weight falls to about a third after 2 hours). Before the first useful reading of the day, the forecast is used alone. If the forecast can't be loaded, the last hour's share fades back towards clear sky over about 3 hours instead, which errs on the side of more UV. The share never goes above 1: broken cloud can briefly push UV above clear sky, but not predictably.
+Tested against ARPANSA's measurements at 10 sites over 16–24 November 2026, for the rest of the day on cloudy days, the clear-sky forecast was typically 64% too high. The blend was typically 18% out, and too low by over 25% in 9% of cases (usually a cloudy morning that cleared). Cloud is hard to predict hour by hour, and on a few stormy days every method was out two- to fourfold, so the burn card also gives the time if the sky clears.
+The chart shows likely UV as a dashed blue line, and "If it clears" as a grey dashed dose curve. The hourly table marks the minutes of likely UV. Sun protection times use the cautious case (the clear-sky forecast ahead).
+To get the forecast, the app sends the ARPANSA site's map coordinates (a public monitoring station, nothing about you) to Open-Meteo about once every half hour while you look at today or tomorrow.
 
 ## Sunburn
 Sunburn can take 16–24 hours to show fully.
@@ -1345,5 +1479,5 @@ def run(client: ArpansaClient | None = None, settings: Settings | None = None) -
         except Exception:
             pass
     root = tk.Tk()
-    App(root, client or ArpansaClient(), settings or Settings.load())
+    App(root, client or ArpansaClient(), settings or Settings.load(), OpenMeteoClient())
     root.mainloop()

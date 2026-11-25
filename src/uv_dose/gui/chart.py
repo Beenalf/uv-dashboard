@@ -45,6 +45,7 @@ from uv_dose.gui.theme import Palette, mpl_font_family  # noqa: E402
 DASH_FORECAST = (0, (4, 3))
 DASH_THRESHOLD = (0, (6, 3))
 DASH_TAIL = (0, (1.5, 2.5))
+DASH_LIKELY = (0, (2.5, 1.5))
 CLICK_TOLERANCE = timedelta(minutes=2)
 CLICK_PIXELS = 4
 PROTECTION_COLOR = UV_CATEGORIES[2].color  # the "High" orange: a caution colour that reads on light and dark
@@ -68,6 +69,7 @@ class ChartView:
     times: list[datetime] = field(default_factory=list)
     measured: list[float | None] = field(default_factory=list)
     forecast: list[float | None] = field(default_factory=list)
+    likely: list[float | None] = field(default_factory=list)  # clear-sky forecast scaled for cloud (later today)
     show_measured: bool = True
     latest_reading: datetime | None = None  # only on a live (today) chart
     outings: list[tuple[datetime, datetime]] = field(default_factory=list)
@@ -76,9 +78,11 @@ class ChartView:
     curve: tuple[list[datetime], list[float]] = ((), ())  # dose on skin across the outings
     tail: tuple[list[datetime], list[float]] = ((), ())  # ... continued after the last outing
     clear_curve: tuple[list[datetime], list[float]] = ((), ())  # clear-sky equivalent, for comparison
+    clear_label: str | None = None  # the clear curve's legend entry (default: "Same window, clear sky")
     dose_label: str = "Dose on your skin"
     med_sed: float = 2.5
     burn_at: datetime | None = None
+    burn_clear_at: datetime | None = None  # the burn time if it clears, when it differs from burn_at (likely UV)
     # When the vitamin D goal is reached. It has no line of its own: the panel shows the sunburn
     # dose, and the vitamin D dose grows at a different rate (slower when the sun is low).
     vitd_at: datetime | None = None
@@ -251,10 +255,14 @@ class DoseChart:
         if v.show_measured:
             ax1.plot(v.times, [nan if x is None else x for x in v.measured], color=p.series, lw=1.6,
                      label="Measured", zorder=3, solid_capstyle="round")
+        if any(x is not None for x in v.likely):
+            ax1.plot(v.times, [nan if x is None else x for x in v.likely], color=p.series, lw=1.4, alpha=0.8,
+                     ls=DASH_LIKELY, label="Likely, with cloud", zorder=2.8)
         if v.latest_reading:
             ax1.axvline(v.latest_reading, color=p.muted, lw=0.9, zorder=1)
-            ax1.annotate(f"Latest reading {v.latest_reading:%H:%M}", (v.latest_reading, ymax), xytext=(4, -4),
-                         textcoords="offset points", va="top", ha="left", fontsize=8, color=p.ink2)
+            ax1.annotate(f"Latest reading {v.latest_reading:%H:%M}", (v.latest_reading, ymax), xytext=(4, -30),
+                         textcoords="offset points", va="top", ha="left", fontsize=8, color=p.ink2, zorder=6,
+                         bbox={"boxstyle": "round,pad=0.2", "fc": p.surface, "ec": "none", "alpha": 0.8})
         if v.protection:
             self._draw_protection(*v.protection)
         ax1.set_ylabel("UV Index", color=p.ink2)
@@ -271,8 +279,8 @@ class DoseChart:
                      zorder=2)
         kt, kv = v.clear_curve
         if kt:
-            ax2.plot(kt, kv, color=p.forecast, lw=1.1, ls=DASH_FORECAST,
-                     label="Same outings, clear sky" if len(v.outings) > 1 else "Same window, clear sky", zorder=2)
+            label = v.clear_label or ("Same outings, clear sky" if len(v.outings) > 1 else "Same window, clear sky")
+            ax2.plot(kt, kv, color=p.forecast, lw=1.1, ls=DASH_FORECAST, label=label, zorder=2)
 
         vitd_level = _curve_value(v, v.vitd_at)  # keep its marker below the legend, like the burn's
         top = max(v.med_sed * 1.3, (cv[-1] if cv else 0) * 1.15, (kv[-1] if kv else 0) * 1.05,
@@ -284,24 +292,38 @@ class DoseChart:
         # Event labels. The vitamin D marker sits on the dose curve at its time. Its label goes
         # left of the marker, or right if it comes after the burn (whose label is above-left of
         # its own marker; the curve is below there). Labels near the left edge flip right.
+        # When cloud is expected, the burn has two markers: hollow if it clears (the earlier
+        # one, which carries the label for both) and filled for the likely time.
         span = (v.day_end - v.day_start) or timedelta(hours=1)
-        vitd_after_burn = v.vitd_at is not None and v.burn_at is not None and v.vitd_at > v.burn_at
-        for when, level, color, text, upper in (
-            (v.vitd_at, vitd_level, p.good, "Vitamin D", False),
-            (v.burn_at, v.med_sed, p.critical, "Burn", True),
+        burn_label_at = v.burn_clear_at or v.burn_at
+        if v.burn_clear_at:
+            burn_text = f"Burn {v.burn_clear_at:%H:%M} if clear" + (f", likely {v.burn_at:%H:%M}" if v.burn_at
+                                                                     else "")
+            ax1.axvline(v.burn_clear_at, color=p.critical, lw=1.0, alpha=0.45, ls=DASH_FORECAST, zorder=2.5)
+            ax2.axvline(v.burn_clear_at, color=p.critical, lw=1.0, alpha=0.35, ls=DASH_FORECAST, zorder=1.4)
+            ax2.plot([v.burn_clear_at], [v.med_sed], "o", ms=6, color=p.critical, mfc=p.surface, mew=1.6,
+                     zorder=5)
+        else:
+            burn_text = f"Burn {v.burn_at:%H:%M}" if v.burn_at else ""
+        vitd_after_burn = v.vitd_at is not None and burn_label_at is not None and v.vitd_at > burn_label_at
+        for when, level, color, text, upper, at in (
+            (v.vitd_at, vitd_level, p.good, f"Vitamin D {v.vitd_at:%H:%M}" if v.vitd_at else "", False, v.vitd_at),
+            (v.burn_at, v.med_sed, p.critical, burn_text, True, burn_label_at),
         ):
-            if when is None or level is None:
+            if when is not None and level is not None:
+                ax1.axvline(when, color=color, lw=1.0, alpha=0.9, zorder=2.5)
+                ax2.axvline(when, color=color, lw=1.0, alpha=0.5, zorder=1.4)
+                ax2.plot([when], [level], "o", ms=7, color=color, mec=p.surface, mew=2, zorder=5)
+            if at is None or level is None or not text:
                 continue
-            ax1.axvline(when, color=color, lw=1.0, alpha=0.9, zorder=2.5)
-            ax2.axvline(when, color=color, lw=1.0, alpha=0.5, zorder=1.4)
-            ax2.plot([when], [level], "o", ms=7, color=color, mec=p.surface, mew=2, zorder=5)
+            when = at
             near_left = (when - v.day_start) / span < 0.12
             if upper:
                 xytext, ha, va = ((8, -5), "left", "top") if near_left else ((-6, 5), "right", "bottom")
             else:
                 xytext, ha, va = (((8, 0), "left", "center") if near_left or vitd_after_burn
                                   else ((-8, 0), "right", "center"))
-            ax2.annotate(f"{text} {when:%H:%M}", (when, level), xytext=xytext, textcoords="offset points",
+            ax2.annotate(text, (when, level), xytext=xytext, textcoords="offset points",
                          va=va, ha=ha, fontsize=8, color=p.ink, fontweight="bold", zorder=6,
                          bbox={"boxstyle": "round,pad=0.25", "fc": p.surface, "ec": "none", "alpha": 0.85})
 

@@ -15,6 +15,10 @@ whole SEDs).
 
 The dose is "ambient": what a horizontal, unshaded surface receives. Skin
 facing other directions, shade and clothing all reduce it.
+
+Minutes without a reading (later today, or a day ahead) use ARPANSA's clear-sky
+forecast, scaled for cloud when there's a cloud outlook (``uv_dose.clouds``): those
+are the "likely" minutes.
 """
 
 from __future__ import annotations
@@ -23,11 +27,14 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
 from uv_dose.arpansa import DayData
 from uv_dose.sun import cos_zenith
 from uv_dose.vitamin_d import vitamin_d_factor
+
+if TYPE_CHECKING:
+    from uv_dose.clouds import CloudOutlook
 
 UVI_WATTS_PER_M2 = 0.025
 SED_JOULES_PER_M2 = 100.0
@@ -35,13 +42,14 @@ SED_PER_UVI_MINUTE = UVI_WATTS_PER_M2 * 60 / SED_JOULES_PER_M2  # 0.015
 
 ONE_MINUTE = timedelta(minutes=1)
 
-PointKind = Literal["measured", "forecast", "missing"]
+# "forecast": ARPANSA's clear-sky forecast as is. "likely": the clear-sky forecast scaled for cloud.
+PointKind = Literal["measured", "forecast", "likely", "missing"]
 
 
 class Source(StrEnum):
     """Which ARPANSA series to integrate."""
 
-    BEST = "best"  # measured where available, clear-sky forecast where not (e.g. later today)
+    BEST = "best"  # measured where available; elsewhere the forecast, scaled for cloud if there's an outlook
     CLEAR_SKY = "clear_sky"  # ARPANSA's clear-sky forecast only (a cloudless upper bound)
 
 
@@ -53,12 +61,20 @@ class UVPoint:
     vitd_factor: float = 1.0  # vitamin D per unit of sunburn UV at this minute's sun angle (vitamin_d_factor)
 
 
-def build_series(day: DayData, source: Source = Source.BEST) -> list[UVPoint]:
+def build_series(day: DayData, source: Source = Source.BEST, clouds: CloudOutlook | None = None) -> list[UVPoint]:
+    """One point per minute of ``day``.
+
+    With ``clouds`` (and ``Source.BEST``), minutes from ``clouds.start`` on that have
+    no reading get the clear-sky forecast times the outlook's cloud factor.
+    """
     factors = [vitamin_d_factor(mu) for mu in cos_zenith(day.site, day.day, [s.time for s in day.samples])]
+    scale = clouds if source is Source.BEST else None
     points: list[UVPoint] = []
     for s, f in zip(day.samples, factors):
         if source is Source.BEST and s.measured is not None:
             points.append(UVPoint(s.time, s.measured, "measured", f))
+        elif s.forecast is not None and scale is not None and s.time >= scale.start:
+            points.append(UVPoint(s.time, s.forecast * scale.factor(s.time), "likely", f))
         elif s.forecast is not None:
             points.append(UVPoint(s.time, s.forecast, "forecast", f))
         else:
@@ -86,8 +102,9 @@ class WindowDose:
     peak_uvi: float
     peak_time: datetime | None
     mean_uvi: float
-    forecast_minutes: int
+    forecast_minutes: int  # clear-sky forecast, as is
     missing_minutes: int
+    likely_minutes: int = 0  # clear-sky forecast scaled for cloud
 
     @property
     def joules_per_m2(self) -> float:
@@ -112,6 +129,7 @@ def window_dose(series: Sequence[UVPoint], start: datetime, end: datetime) -> Wi
         mean_uvi=(sum(p.uvi for p in pts) / len(pts)) if pts else 0.0,
         forecast_minutes=sum(1 for p in pts if p.kind == "forecast"),
         missing_minutes=sum(1 for p in pts if p.kind == "missing"),
+        likely_minutes=sum(1 for p in pts if p.kind == "likely"),
     )
 
 
@@ -129,6 +147,7 @@ class HourRow:
     cumulative_sed: float
     forecast_minutes: int
     missing_minutes: int
+    likely_minutes: int = 0
 
 
 def hourly_breakdown(series: Sequence[UVPoint], start: datetime, end: datetime) -> list[HourRow]:
@@ -154,6 +173,7 @@ def hourly_breakdown(series: Sequence[UVPoint], start: datetime, end: datetime) 
                     cumulative_sed=total,
                     forecast_minutes=sum(1 for p in pts if p.kind == "forecast"),
                     missing_minutes=sum(1 for p in pts if p.kind == "missing"),
+                    likely_minutes=sum(1 for p in pts if p.kind == "likely"),
                 )
             )
         cursor = stop
